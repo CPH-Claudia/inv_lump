@@ -7,6 +7,47 @@ Created on Mon Mar 16 16:32:43 2026
 import pandas as pd
 import numpy as np
 
+# %% 壽險拆分 feature engineering
+def add_life_ratio_features(df):
+    df = df.copy()
+
+    # =========================
+    # 1. 是否有壽險（關鍵🔥）
+    # =========================
+    df["是否有壽險"] = (df["壽險保單數"] > 0).astype(int)
+
+    # =========================
+    # 2. 壽險保費占比（只在有壽險時計算）
+    # =========================
+    df["壽險保費占比_clean"] = np.where(
+        df["累計保單總保費"] > 0,
+        df["累計壽險保單總保費"] / df["累計保單總保費"],
+        np.nan
+    )
+
+    # =========================
+    # 3. 分箱（方案A🔥）
+    # =========================
+    def bin_func(row):
+        if row["是否有壽險"] == 0:
+            return "無壽險"
+        
+        x = row["壽險保費占比_clean"]
+        
+        if pd.isna(x):
+            return "異常"
+        elif x <= 0.5:
+            return "低"
+        elif x <= 0.8:
+            return "中"
+        else:
+            return "高"
+
+    df["壽險保費占比_bin"] = df.apply(bin_func, axis=1)
+
+    return df
+
+
 # %% 建立轉換率分箱函式：讓每箱樣本數盡量接近
 # 套用分箱
 def apply_bins(series: pd.Series, bin_edges: list, right: bool = True):
@@ -316,100 +357,100 @@ def build_rule_score_from_profile(
 
     return df
 
-# %% 主程式
-def run_rule_scoring_pipeline(
-    customer_df: pd.DataFrame,
-    benchmark_snapshot_df: pd.DataFrame,
-    feature_config: dict,
-    group_weights: dict,
-    low_value_config: dict = None,
-    q: int = 5,
-    min_total_count: int = 30,
-    smoothing_k: int = 100,
-    id_col: str = "被保人身分證字號"
-):
-    """
-    完整 rule scoring pipeline
+# # %% 主程式
+# def run_rule_scoring_pipeline(
+#     customer_df: pd.DataFrame,
+#     benchmark_snapshot_df: pd.DataFrame,
+#     feature_config: dict,
+#     group_weights: dict,
+#     low_value_config: dict = None,
+#     q: int = 5,
+#     min_total_count: int = 30,
+#     smoothing_k: int = 100,
+#     id_col: str = "被保人身分證字號"
+# ):
+#     """
+#     完整 rule scoring pipeline
 
-    流程：
-    1. 從 customer_df 建 candidate_df
-    2. 檢查 feature 是否存在
-    3. 建 score_tables
-    4. 計算 candidate rule_score
-    """
+#     流程：
+#     1. 從 customer_df 建 candidate_df
+#     2. 檢查 feature 是否存在
+#     3. 建 score_tables
+#     4. 計算 candidate rule_score
+#     """
 
-    # 1) candidate pool
-    candidate_df, funnel_df = build_candidate_pool(customer_df)
+#     # 1) candidate pool
+#     candidate_df, funnel_df = build_candidate_pool(customer_df)
 
-    benchmark_profile_for_rule = benchmark_snapshot_df.copy()
-    candidate_profile_for_rule = candidate_df.copy()
+#     benchmark_profile_for_rule = benchmark_snapshot_df.copy()
+#     candidate_profile_for_rule = candidate_df.copy()
 
-    # 2) 檢查欄位
-    validate_result = validate_rule_features(
-        feature_config=feature_config,
-        benchmark_df=benchmark_profile_for_rule,
-        candidate_df=candidate_profile_for_rule
-    )
+#     # 2) 檢查欄位
+#     validate_result = validate_rule_features(
+#         feature_config=feature_config,
+#         benchmark_df=benchmark_profile_for_rule,
+#         candidate_df=candidate_profile_for_rule
+#     )
 
-    if validate_result["missing_in_benchmark"] or validate_result["missing_in_candidate"]:
-        raise ValueError(
-            f"feature_config 欄位不齊。\n"
-            f"missing_in_benchmark={validate_result['missing_in_benchmark']}\n"
-            f"missing_in_candidate={validate_result['missing_in_candidate']}"
-        )
+#     if validate_result["missing_in_benchmark"] or validate_result["missing_in_candidate"]:
+#         raise ValueError(
+#             f"feature_config 欄位不齊。\n"
+#             f"missing_in_benchmark={validate_result['missing_in_benchmark']}\n"
+#             f"missing_in_candidate={validate_result['missing_in_candidate']}"
+#         )
 
-    # 3) score tables
-    score_tables, bin_edges_dict = build_rule_score_tables(
-        benchmark_df=benchmark_profile_for_rule,
-        candidate_df=candidate_profile_for_rule,
-        feature_config=feature_config,
-        q=q,
-        min_total_count=min_total_count,
-        smoothing_k=smoothing_k,
-        low_value_config=low_value_config
-    )
+#     # 3) score tables
+#     score_tables, bin_edges_dict = build_rule_score_tables(
+#         benchmark_df=benchmark_profile_for_rule,
+#         candidate_df=candidate_profile_for_rule,
+#         feature_config=feature_config,
+#         q=q,
+#         min_total_count=min_total_count,
+#         smoothing_k=smoothing_k,
+#         low_value_config=low_value_config
+#     )
 
-    # 4) candidate scoring
-    candidate_rule_scored_df = build_rule_score_from_profile(
-        profile_df=candidate_profile_for_rule,
-        feature_config=feature_config,
-        group_weights=group_weights,
-        score_tables=score_tables,
-        bin_edges_dict=bin_edges_dict,
-        id_col=id_col
-    )
+#     # 4) candidate scoring
+#     candidate_rule_scored_df = build_rule_score_from_profile(
+#         profile_df=candidate_profile_for_rule,
+#         feature_config=feature_config,
+#         group_weights=group_weights,
+#         score_tables=score_tables,
+#         bin_edges_dict=bin_edges_dict,
+#         id_col=id_col
+#     )
 
-    # 5) 排序
-    candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
-        "rule_score", ascending=False
-    ).reset_index(drop=True)
+#     # 5) 排序
+#     candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
+#         "rule_score", ascending=False
+#     ).reset_index(drop=True)
 
-    return {
-        "candidate_df": candidate_df,
-        "funnel_df": funnel_df,
-        "score_tables": score_tables,
-        "bin_edges_dict": bin_edges_dict,
-        "candidate_rule_scored_df": candidate_rule_scored_df
-    }
+#     return {
+#         "candidate_df": candidate_df,
+#         "funnel_df": funnel_df,
+#         "score_tables": score_tables,
+#         "bin_edges_dict": bin_edges_dict,
+#         "candidate_rule_scored_df": candidate_rule_scored_df
+#     }
 
-# %% 執行
-rule_pipeline_result = run_rule_scoring_pipeline(
-    customer_df=customer_df,
-    benchmark_snapshot_df=benchmark_snapshot_df,
-    feature_config=feature_config,
-    group_weights=group_weights,
-    low_value_config=COUNT_LIKE_BIN_CONFIG,
-    q=5,
-    min_total_count=30,
-    smoothing_k=100,
-    id_col="被保人身分證字號"
-)
+# # %% 執行
+# rule_pipeline_result = run_rule_scoring_pipeline(
+#     customer_df=customer_df,
+#     benchmark_snapshot_df=benchmark_snapshot_df,
+#     feature_config=feature_config,
+#     group_weights=group_weights,
+#     low_value_config=COUNT_LIKE_BIN_CONFIG,
+#     q=5,
+#     min_total_count=30,
+#     smoothing_k=100,
+#     id_col="被保人身分證字號"
+# )
 
-candidate_df = rule_pipeline_result["candidate_df"]
-funnel_df = rule_pipeline_result["funnel_df"]
-score_tables = rule_pipeline_result["score_tables"]
-bin_edges_dict = rule_pipeline_result["bin_edges_dict"]
-candidate_rule_scored_df = rule_pipeline_result["candidate_rule_scored_df"]
+# candidate_df = rule_pipeline_result["candidate_df"]
+# funnel_df = rule_pipeline_result["funnel_df"]
+# score_tables = rule_pipeline_result["score_tables"]
+# bin_edges_dict = rule_pipeline_result["bin_edges_dict"]
+# candidate_rule_scored_df = rule_pipeline_result["candidate_rule_scored_df"]
 
 # %% 看細節
 # 看 top candidate
@@ -428,7 +469,49 @@ candidate_rule_scored_df[
 # 看某欄位分箱表
 壽險保單數 = score_tables["壽險保單數"]
 保單數 = score_tables["保單數"]
-score_tables["近1年保單數"]
+近1年保單數 = score_tables["近1年保單數"]
+
+
+def build_rulebook_df(score_tables: dict) -> pd.DataFrame:
+    """
+    將 score_tables（每個 feature 一張表）
+    合併成一張完整 rulebook（方便檢視 / 匯出）
+    """
+
+    all_tables = []
+
+    for feature, df in score_tables.items():
+        tmp = df.copy()
+
+        # 加 feature 名稱
+        tmp["feature"] = feature
+
+        # 統一欄位名稱（避免不同表不一致）
+        rename_map = {
+            "bin": "分箱",
+            "benchmark_cnt": "benchmark人數",
+            "candidate_cnt": "candidate人數",
+            "total_cnt": "總人數",
+            "raw_conversion": "原始轉換率",
+            "smoothed_conversion": "平滑轉換率",
+            "score": "分數",
+            "usable": "是否使用"
+        }
+
+        tmp = tmp.rename(columns={k: v for k, v in rename_map.items() if k in tmp.columns})
+
+        all_tables.append(tmp)
+
+    rulebook_df = pd.concat(all_tables, axis=0, ignore_index=True)
+
+    # 排序（先 feature，再分數）
+    if "分數" in rulebook_df.columns:
+        rulebook_df = rulebook_df.sort_values(["feature", "分數"], ascending=[True, False])
+
+    return rulebook_df
+
+rulebook_df = build_rulebook_df(score_tables)
+
 
 import matplotlib.pyplot as plt
 plt.rc('font', family = 'Microsoft JhengHei')
@@ -437,6 +520,8 @@ plt.rcParams['axes.unicode_minus'] = False
 data = candidate_rule_scored_df["rule_score"].dropna()
 plt.figure(figsize=(8, 5))
 counts, bins, patches = plt.hist(data, bins=50, alpha=0.6)
+
+
 
 
 # %% 輸出
@@ -483,6 +568,7 @@ def build_candidate_pool(
 
     return candidate_df, funnel_df
 
+candidate_df, funnel_df = build_candidate_pool(customer_df) # 看漏斗: funnel_df
 
 # %% 執行
 benchmark_profile_for_rule = benchmark_snapshot_df.copy()
@@ -565,30 +651,38 @@ COUNT_LIKE_BIN_CONFIG = {
     "近1年保單數": [0, 1, 2],
 }
 
+# 
+benchmark_profile_for_rule = add_life_ratio_features(benchmark_profile_for_rule)
+candidate_profile_for_rule = add_life_ratio_features(candidate_profile_for_rule)
+
 
 # 建立所有欄位的 score table
 score_tables, bin_edges_dict = build_rule_score_tables(
     benchmark_df=benchmark_profile_for_rule,
     candidate_df=candidate_profile_for_rule,
     feature_config=feature_config,
-    q=5,                 # 先切 5 箱
-    min_total_count=30,  # 每箱至少 30 筆
-    smoothing_k=100      # 平滑強度
+    q=5,
+    min_total_count=30,
+    smoothing_k=100,
+    low_value_config=COUNT_LIKE_BIN_CONFIG
 )
-
-# 單獨開一張表檢查
-壽險保單數 = score_tables["壽險保單數"] 
 
 # 把 score table 套回 candidate，生成 rule score
 candidate_rule_scored_df = build_rule_score_from_profile(
     profile_df=candidate_profile_for_rule,
     feature_config=feature_config,
+    group_weights=group_weights,
     score_tables=score_tables,
     bin_edges_dict=bin_edges_dict,
     id_col="被保人身分證字號"
 )
 
-# 看結果
+# 5) 排序
+candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
+    "rule_score", ascending=False
+).reset_index(drop=True)
+
+# %% 看結果
 candidate_rule_scored_df[
     [
         "被保人身分證字號",
