@@ -36,12 +36,60 @@ snapshot_date = 首次購買日 - 365 天
 只保留 snapshot 前已經有保單的客戶
 """
 
-def build_positive_snapshot_dates(policy_df: pd.DataFrame,
-                                  horizon_days: int = 365) -> pd.DataFrame:
+# def build_positive_snapshot_dates(policy_df: pd.DataFrame,
+#                                   horizon_days: int = 365) -> pd.DataFrame:
+#     df = policy_df.copy()
+#     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+#     df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce").fillna(0)
+
+#     first_buy_df = (
+#         df[df[TARGET_COL] == 1]
+#         .sort_values([ID_COL, DATE_COL, POLICY_ID_COL])
+#         .groupby(ID_COL, as_index=False)
+#         .first()[[ID_COL, DATE_COL, POLICY_ID_COL]]
+#         .rename(columns={
+#             DATE_COL: "first_buy_date",
+#             POLICY_ID_COL: "first_buy_policy_id"
+#         })
+#     )
+
+#     if first_buy_df.empty:
+#         return pd.DataFrame(columns=[ID_COL, "snapshot_date", "label", "event_date"])
+
+#     first_buy_df["snapshot_date"] = first_buy_df["first_buy_date"] - pd.Timedelta(days=horizon_days)
+#     first_buy_df["label"] = 1
+#     first_buy_df["event_date"] = first_buy_df["first_buy_date"]
+
+#     first_policy_df = (
+#         df.groupby(ID_COL, as_index=False)[DATE_COL]
+#         .min()
+#         .rename(columns={DATE_COL: "first_policy_date"})
+#     )
+
+#     pos_df = first_buy_df.merge(first_policy_df, on=ID_COL, how="left")
+#     pos_df = pos_df[pos_df["first_policy_date"] <= pos_df["snapshot_date"]].copy()
+
+#     return pos_df[[ID_COL, "snapshot_date", "label", "event_date"]]
+
+def build_positive_snapshot_dates(
+    policy_df: pd.DataFrame,
+    horizon_days: int = 365
+) -> pd.DataFrame:
+    """
+    正樣本（對稱版本）：
+    - 找每位客戶首次買躉繳投資型的日期 first_buy_date
+    - 從 first_buy_date 之前的實際保單日中，找出：
+        snapshot_date < first_buy_date
+        且 first_buy_date <= snapshot_date + horizon_days
+    - 也就是：snapshot_date 後一年內會買
+    - 每人只取一筆：取符合條件的最後一張保單日
+    """
+
     df = policy_df.copy()
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce").fillna(0)
 
+    # 1) 每位客戶首次買躉繳投資型
     first_buy_df = (
         df[df[TARGET_COL] == 1]
         .sort_values([ID_COL, DATE_COL, POLICY_ID_COL])
@@ -54,22 +102,41 @@ def build_positive_snapshot_dates(policy_df: pd.DataFrame,
     )
 
     if first_buy_df.empty:
-        return pd.DataFrame(columns=[ID_COL, "snapshot_date", "label", "event_date"])
+        return pd.DataFrame(columns=[
+            ID_COL, "snapshot_date", "label", "event_date", "first_buy_policy_id"
+        ])
 
-    first_buy_df["snapshot_date"] = first_buy_df["first_buy_date"] - pd.Timedelta(days=horizon_days)
-    first_buy_df["label"] = 1
-    first_buy_df["event_date"] = first_buy_df["first_buy_date"]
+    # 2) 與所有歷史保單 merge，找出符合條件的 snapshot 候選
+    merged = df.merge(first_buy_df[[ID_COL, "first_buy_date", "first_buy_policy_id"]], on=ID_COL, how="inner")
 
-    first_policy_df = (
-        df.groupby(ID_COL, as_index=False)[DATE_COL]
-        .min()
-        .rename(columns={DATE_COL: "first_policy_date"})
+    # 候選條件：
+    # - snapshot_date 必須在 first_buy_date 之前
+    # - snapshot_date 後一年內會買
+    candidate_pos = merged[
+        (merged[DATE_COL] < merged["first_buy_date"]) &
+        (merged["first_buy_date"] <= merged[DATE_COL] + pd.Timedelta(days=horizon_days))
+    ].copy()
+
+    if candidate_pos.empty:
+        return pd.DataFrame(columns=[
+            ID_COL, "snapshot_date", "label", "event_date", "first_buy_policy_id"
+        ])
+
+    # 3) 每位客戶取最後一張符合條件的保單日
+    pos_df = (
+        candidate_pos
+        .sort_values([ID_COL, DATE_COL, POLICY_ID_COL])
+        .groupby(ID_COL, as_index=False)
+        .last()[[ID_COL, DATE_COL, "first_buy_date", "first_buy_policy_id"]]
+        .rename(columns={
+            DATE_COL: "snapshot_date",
+            "first_buy_date": "event_date"
+        })
     )
 
-    pos_df = first_buy_df.merge(first_policy_df, on=ID_COL, how="left")
-    pos_df = pos_df[pos_df["first_policy_date"] <= pos_df["snapshot_date"]].copy()
+    pos_df["label"] = 1
 
-    return pos_df[[ID_COL, "snapshot_date", "label", "event_date"]]
+    return pos_df[[ID_COL, "snapshot_date", "label", "event_date", "first_buy_policy_id"]]
 
 # %% 4. 建立負樣本 snapshot
 """
@@ -78,29 +145,73 @@ snapshot_date = 最後一張可完整觀察一年結果的保單日
 label = 0
 """
 
-def build_negative_snapshot_dates(policy_df: pd.DataFrame,
-                                  label_cutoff_date: pd.Timestamp) -> pd.DataFrame:
+# def build_negative_snapshot_dates(policy_df: pd.DataFrame,
+#                                   label_cutoff_date: pd.Timestamp) -> pd.DataFrame:
+#     df = policy_df.copy()
+#     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+#     df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce").fillna(0)
+
+#     ever_buy_ids = set(df.loc[df[TARGET_COL] == 1, ID_COL].dropna().unique())
+
+#     never_buy_df = df[~df[ID_COL].isin(ever_buy_ids)].copy()
+#     eligible_df = never_buy_df[never_buy_df[DATE_COL] <= label_cutoff_date].copy()
+
+#     neg_df = (
+#         eligible_df
+#         .sort_values([ID_COL, DATE_COL, POLICY_ID_COL])
+#         .groupby(ID_COL, as_index=False)
+#         .last()[[ID_COL, DATE_COL]]
+#         .rename(columns={DATE_COL: "snapshot_date"})
+#     )
+
+#     neg_df["label"] = 0
+#     neg_df["event_date"] = pd.NaT
+
+#     return neg_df[[ID_COL, "snapshot_date", "label", "event_date"]]
+
+def build_negative_snapshot_dates(
+    policy_df: pd.DataFrame,
+    label_cutoff_date: pd.Timestamp
+) -> pd.DataFrame:
+    """
+    負樣本（對稱版本）：
+    - 從未買過躉繳投資型的客戶
+    - 從其真實存在的保單日中，找一個可完整觀察一年結果的 snapshot_date
+    - 這裡採每人最後一張 <= label_cutoff_date 的保單日
+    """
+
     df = policy_df.copy()
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce").fillna(0)
 
+    # 1) 曾買過者
     ever_buy_ids = set(df.loc[df[TARGET_COL] == 1, ID_COL].dropna().unique())
 
+    # 2) 從未買過者
     never_buy_df = df[~df[ID_COL].isin(ever_buy_ids)].copy()
+
+    # 3) 只保留可完整觀察 horizon 的保單日
     eligible_df = never_buy_df[never_buy_df[DATE_COL] <= label_cutoff_date].copy()
 
+    if eligible_df.empty:
+        return pd.DataFrame(columns=[ID_COL, "snapshot_date", "label", "event_date", "snapshot_policy_id"])
+
+    # 4) 每位客戶取最後一張可用保單日作為 snapshot
     neg_df = (
         eligible_df
         .sort_values([ID_COL, DATE_COL, POLICY_ID_COL])
         .groupby(ID_COL, as_index=False)
-        .last()[[ID_COL, DATE_COL]]
-        .rename(columns={DATE_COL: "snapshot_date"})
+        .last()[[ID_COL, DATE_COL, POLICY_ID_COL]]
+        .rename(columns={
+            DATE_COL: "snapshot_date",
+            POLICY_ID_COL: "snapshot_policy_id"
+        })
     )
 
     neg_df["label"] = 0
     neg_df["event_date"] = pd.NaT
 
-    return neg_df[[ID_COL, "snapshot_date", "label", "event_date"]]
+    return neg_df[[ID_COL, "snapshot_date", "label", "event_date", "snapshot_policy_id"]]
 
 # %% 5. 合併成 snapshot master
 
@@ -487,6 +598,10 @@ def build_model_dataset(policy_df: pd.DataFrame):
         data_end_date=DATA_END_DATE,
         horizon_days=HORIZON_DAYS
     )
+    
+    print(snapshot_master_df["label"].value_counts(dropna=False))
+    print(snapshot_master_df["snapshot_date"].min(), snapshot_master_df["snapshot_date"].max())
+    print(snapshot_master_df.head())
 
     snapshot_feature_df = build_snapshot_features(
         policy_df=policy_df,
@@ -644,6 +759,84 @@ pd.concat([
     xgb_result["test_metrics"]
 ], axis=0)
 
+# %% 19-1. XGB feature importance
+xgb_model = xgb_result["model"]
+
+importance = pd.DataFrame({
+    "feature": X_train.columns,
+    "importance": xgb_model.feature_importances_
+}).sort_values("importance", ascending=False)
+
+print(importance.head(15))
+
+
+
+# %% 對 candidate 建特徵
+candidate_model_df = candidate_rule_scored_df.copy()
+
+# 補欄位: 主約商品主類別切換次數
+def calc_product_main_type_switch(df):
+    """
+    計算每個客戶的「主約商品主類別切換次數」
+    """
+    df = df.copy()
+
+    required_cols = ["被保人身分證字號", "投保日", "保單申請案號", "主約商品險種主類別"]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"缺少必要欄位: {missing_cols}")
+
+    # 排序
+    df["投保日"] = pd.to_datetime(df["投保日"], errors="coerce")
+    df = df.sort_values(["被保人身分證字號", "投保日", "保單申請案號"]).copy()
+
+    # 前一筆主類別
+    df["prev_main_type"] = df.groupby("被保人身分證字號")["主約商品險種主類別"].shift(1)
+
+    # 先做布林判斷，再把 NA 補成 False
+    is_switch = (
+        (df["主約商品險種主類別"] != df["prev_main_type"]) &
+        df["prev_main_type"].notna() &
+        df["主約商品險種主類別"].notna()
+    )
+
+    df["is_switch"] = is_switch.fillna(False).astype(int)
+
+    # 聚合到客戶層
+    switch_df = (
+        df.groupby("被保人身分證字號", dropna=False)["is_switch"]
+        .sum()
+        .reset_index()
+        .rename(columns={"is_switch": "主約商品主類別切換次數"})
+    )
+
+    return switch_df
+
+# 套入 cadidate_model_df
+switch_df = calc_product_main_type_switch(policy_df)
+
+candidate_model_df = candidate_model_df.merge(
+    switch_df,
+    on="被保人身分證字號",
+    how="left"
+)
+
+candidate_model_df["主約商品主類別切換次數"] = (
+    candidate_model_df["主約商品主類別切換次數"]
+    .fillna(0)
+)
+
+# 若沒有 snapshot_date，可先用最近投保日當 proxy，再補年月
+if "snapshot_date" not in candidate_model_df.columns:
+    if "最近投保日" in candidate_model_df.columns:
+        candidate_model_df["snapshot_date"] = pd.to_datetime(candidate_model_df["最近投保日"], errors="coerce")
+    else:
+        candidate_model_df["snapshot_date"] = pd.Timestamp("2026-03-01")
+
+candidate_model_df = add_snapshot_calendar_features(candidate_model_df)
+
+# 保留模型需要欄位
+candidate_model_X = candidate_model_df[feature_cols].copy()
 
 # %% 20. Logistic 打分
 candidate_model_df["model_prob_logistic"] = logit_result["model"].predict_proba(candidate_model_X)[:, 1]
@@ -651,5 +844,191 @@ candidate_model_df["model_prob_logistic"] = logit_result["model"].predict_proba(
 # %% 21. XGBoost 打分
 candidate_X_t = xgb_result["preprocessor"].transform(candidate_model_X)
 candidate_model_df["model_prob_xgb"] = xgb_result["model"].predict_proba(candidate_X_t)[:, 1]
+
+
+# %% 名單 vs 轉換率曲線
+eval_df = test_df.copy()
+
+# model 分數（用 XGB）
+eval_df["model_score"] = xgb_result["model"].predict_proba(X_test)[:, 1]
+
+# 依分數排序 + 分桶
+eval_df = eval_df.sort_values("model_score", ascending=False).reset_index(drop=True)
+
+# 切成 100 等份（百分位）
+eval_df["bucket"] = pd.qcut(
+    eval_df.index,
+    q=100,
+    labels=False
+)
+
+# 算每個 bucket 的轉換率
+bucket_perf = (
+    eval_df.groupby("bucket")
+    .agg(
+        cnt=("label", "count"),
+        pos=("label", "sum")
+    )
+    .reset_index()
+)
+
+bucket_perf["conversion_rate"] = bucket_perf["pos"] / bucket_perf["cnt"]
+
+# 做累積（重點）
+bucket_perf = bucket_perf.sort_values("bucket")
+
+bucket_perf["cum_cnt"] = bucket_perf["cnt"].cumsum()
+bucket_perf["cum_pos"] = bucket_perf["pos"].cumsum()
+bucket_perf["cum_conversion_rate"] = bucket_perf["cum_pos"] / bucket_perf["cum_cnt"]
+
+bucket_perf["population_pct"] = bucket_perf["cum_cnt"] / bucket_perf["cnt"].sum()
+
+# %% 畫圖（核心圖）
+import matplotlib.pyplot as plt
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False
+
+plt.figure()
+plt.plot(bucket_perf["population_pct"], bucket_perf["cum_conversion_rate"])
+plt.xlabel("Population %")
+plt.ylabel("Conversion Rate")
+plt.title("Lift Curve (Model)")
+plt.grid()
+plt.show()
+
+# 解讀
+for p in [0.1, 0.2, 0.3]:
+    subset = bucket_perf[bucket_perf["population_pct"] <= p]
+    print(p, subset["cum_conversion_rate"].iloc[-1])
+
+# %% Rule + Model 最佳權重
+# 準備權重
+eval_df["rule_score_norm"] = (
+    (eval_df["rule_score"] - eval_df["rule_score"].min()) /
+    (eval_df["rule_score"].max() - eval_df["rule_score"].min())
+)
+
+# 測不同權重
+weights = np.arange(0, 1.1, 0.1)
+
+results = []
+
+for w in weights:
+    eval_df["final_score"] = w * eval_df["rule_score_norm"] + (1 - w) * eval_df["model_score"]
+
+    tmp = eval_df.sort_values("final_score", ascending=False).reset_index(drop=True)
+
+    top10 = tmp.head(int(len(tmp) * 0.1))
+    top20 = tmp.head(int(len(tmp) * 0.2))
+
+    results.append({
+        "rule_weight": w,
+        "top10_conversion": top10["label"].mean(),
+        "top20_conversion": top20["label"].mean()
+    })
+
+results_df = pd.DataFrame(results)
+print(results_df)
+
+# 選擇最佳權重
+best = results_df.sort_values("top10_conversion", ascending=False).iloc[0]
+print(best)
+
+
+# %% SHAP 解釋
+import shap
+
+# 初始化 SHAP
+explainer = shap.TreeExplainer(xgb_result["model"])
+shap_values = explainer.shap_values(X_test)
+
+# 全局重要性
+shap.summary_plot(shap_values, X_test)
+
+# 單一客戶解釋
+i = 0  # 第 i 個客戶
+
+shap.force_plot(
+    explainer.expected_value,
+    shap_values[i],
+    X_test.iloc[i]
+)
+
+
+
+# %% Final Score 
+# 先決定用哪一個 model score
+score_col = "model_prob_xgb"
+
+# 正規化 rule score
+candidate_final_df = candidate_model_df.copy()
+
+rule_min = candidate_final_df["rule_score"].min()
+rule_max = candidate_final_df["rule_score"].max()
+
+if rule_max > rule_min:
+    candidate_final_df["rule_score_norm"] = (
+        (candidate_final_df["rule_score"] - rule_min) / (rule_max - rule_min)
+    )
+else:
+    candidate_final_df["rule_score_norm"] = 0.5
+    
+        
+# 融合分數
+RULE_WEIGHT = 0.4
+MODEL_WEIGHT = 0.6
+
+candidate_final_df["final_score"] = (
+    RULE_WEIGHT * candidate_final_df["rule_score_norm"] +
+    MODEL_WEIGHT * candidate_final_df[score_col]
+)
+
+# 排序
+candidate_final_df = candidate_final_df.sort_values(
+    "final_score", ascending=False
+).reset_index(drop=True)
+
+# 排名 & 百分位
+candidate_final_df["final_rank"] = (
+    candidate_final_df["final_score"]
+    .rank(method="first", ascending=False)
+    .astype(int)
+)
+
+candidate_final_df["final_rank_pct"] = (
+    candidate_final_df["final_rank"] / len(candidate_final_df)
+)
+
+# output
+output_cols = [
+    "被保人身分證字號",
+    "目前營業單位",
+    "目前經紀人1業代",
+    "保單數",
+    "壽險保單數",
+    "產險保單數",
+    "累計保單總保費",
+    "累計壽險保單總保費",
+    "近1年保單數",
+    "距離最近投保天數",
+    "rule_score",
+    "rule_score_norm",
+    "model_prob_logistic",
+    "model_prob_xgb",
+    "final_score",
+    "final_rank",
+    "final_rank_pct",
+    "名單等級",
+    "推薦主因"
+]
+
+output_cols = [c for c in output_cols if c in candidate_final_df.columns]
+candidate_output_df = candidate_final_df[output_cols].copy()
+
+print(candidate_output_df["名單等級"].value_counts(dropna=False))
+print(candidate_output_df.head(20))
+
+candidate_output_df.to_excel("candidate_final_score_output.xlsx", index=False)
+
 
 
