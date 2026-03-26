@@ -238,16 +238,32 @@ def build_conversion_rate_score_table(
     )
 
     # 轉成 0-100 score
+    # min_rate = score_table["final_conversion_rate"].min()
+    # max_rate = score_table["final_conversion_rate"].max()
+
+    # if max_rate > min_rate:
+    #     score_table["score"] = 100 * (
+    #         (score_table["final_conversion_rate"] - min_rate) / (max_rate - min_rate)
+    #     )
+    # else:
+    #     score_table["score"] = 50.0
+
+    # score_table["score"] = score_table["score"].round(1)
+    # score_table["feature"] = col
+    
+    MIN_SCORE = 10
+    MAX_SCORE = 100
+    
     min_rate = score_table["final_conversion_rate"].min()
     max_rate = score_table["final_conversion_rate"].max()
-
+    
     if max_rate > min_rate:
-        score_table["score"] = 100 * (
+        score_table["score"] = MIN_SCORE + (
             (score_table["final_conversion_rate"] - min_rate) / (max_rate - min_rate)
-        )
+        ) * (MAX_SCORE - MIN_SCORE)
     else:
-        score_table["score"] = 50.0
-
+        score_table["score"] = (MIN_SCORE + MAX_SCORE) / 2  # fallback
+    
     score_table["score"] = score_table["score"].round(1)
     score_table["feature"] = col
 
@@ -452,6 +468,209 @@ def build_rule_score_from_profile(
 # bin_edges_dict = rule_pipeline_result["bin_edges_dict"]
 # candidate_rule_scored_df = rule_pipeline_result["candidate_rule_scored_df"]
 
+
+
+# %% 建 candidate pool
+def build_candidate_pool(
+    customer_df: pd.DataFrame,
+    require_positive_policy_cnt: bool = True
+):
+    df = customer_df.copy()
+    df.columns = df.columns.str.strip()
+
+    required_cols = ["被保人身分證字號", "是否曾買過躉繳投資型"]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"customer_df 缺少必要欄位: {missing_cols}")
+
+    df["是否曾買過躉繳投資型"] = pd.to_numeric(
+        df["是否曾買過躉繳投資型"], errors="coerce"
+    )
+
+    funnel_records = []
+    funnel_records.append(["全部客戶", len(df)])
+
+    candidate_df = df[df["是否曾買過躉繳投資型"] == 0].copy()
+    funnel_records.append(["未買躉繳投資型", len(candidate_df)])
+
+    if require_positive_policy_cnt and "保單數" in candidate_df.columns:
+        before_cnt = len(candidate_df)
+        candidate_df = candidate_df[candidate_df["保單數"].fillna(0) > 0].copy()
+        funnel_records.append(["保單數 > 0", len(candidate_df)])
+        funnel_records.append(["因保單數<=0被排除", before_cnt - len(candidate_df)])
+
+    candidate_df["candidate標記"] = 1
+
+    funnel_df = pd.DataFrame(funnel_records, columns=["漏斗階段", "客戶數"])
+
+    return candidate_df, funnel_df
+
+candidate_df, funnel_df = build_candidate_pool(customer_df) # 看漏斗: funnel_df
+
+# %% 執行
+benchmark_profile_for_rule = benchmark_snapshot_df.copy()
+candidate_profile_for_rule = candidate_df.copy()
+
+# =========================
+# A. rule feature 設定
+# =========================
+# feature_config = {
+#     # 1) 壽險參與度
+#     "壽險保單數": {
+#         "group": "壽險參與度",
+#         "feature_weight": 0.55,
+#     },
+#     "壽險保單占比": {
+#         "group": "壽險參與度",
+#         "feature_weight": 0.45,
+#     },
+
+#     # 2) 保費能力
+#     "累計壽險保單總保費": {
+#         "group": "保費能力",
+#         "feature_weight": 0.45,
+#     },
+#     "壽險保費占比": {
+#         "group": "保費能力",
+#         "feature_weight": 0.30,
+#     },
+#     "累計保單總保費": {
+#         "group": "保費能力",
+#         "feature_weight": 0.25,
+#     },
+
+#     # 3) 關係深度
+#     "保單數": {
+#         "group": "關係深度",
+#         "feature_weight": 0.70,
+#     },
+#     "產險保單數": {
+#         "group": "關係深度",
+#         "feature_weight": 0.30,
+#     },
+
+#     # 4) FYC結構
+#     "累計壽險保單總繳款FYC": {
+#         "group": "FYC結構",
+#         "feature_weight": 0.60,
+#     },
+#     "壽險繳款FYC占比": {
+#         "group": "FYC結構",
+#         "feature_weight": 0.40,
+#     },
+
+#     # 5) 近期行為
+#     "近1年保單數": {
+#         "group": "近期行為",
+#         "feature_weight": 1.00,
+#     },
+# }
+
+feature_config = {
+    # 1) 壽險參與度
+    "壽險保單數": {
+        "group": "壽險參與度",
+        "feature_weight": 0.60,
+    },
+    "壽險保單占比": {
+        "group": "壽險參與度",
+        "feature_weight": 0.40,
+    },
+
+    # 2) 保費能力
+    "累計保單總保費": {
+        "group": "保費能力",
+        "feature_weight": 0.45,
+    },
+    "累計壽險保單總保費": {
+        "group": "保費能力",
+        "feature_weight": 0.35,
+    },
+    "壽險保費占比": {
+        "group": "保費能力",
+        "feature_weight": 0.20,
+    },
+
+    # 3) 關係深度
+    "保單數": {
+        "group": "關係深度",
+        "feature_weight": 0.75,
+    },
+    "產險保單數": {
+        "group": "關係深度",
+        "feature_weight": 0.25,
+    },
+
+    # 4) FYC結構
+    "累計壽險保單總繳款FYC": {
+        "group": "FYC結構",
+        "feature_weight": 0.70,
+    },
+    "壽險繳款FYC占比": {
+        "group": "FYC結構",
+        "feature_weight": 0.30,
+    },
+
+    # 5) 近期行為
+    "近1年保單數": {
+        "group": "近期行為",
+        "feature_weight": 1.00,
+    },
+}
+
+# =========================
+# B. 群組權重
+# =========================
+group_weights = {
+    "壽險參與度": 0.35,
+    "保費能力": 0.25,
+    "關係深度": 0.15,
+    "FYC結構": 0.10,
+    "近期行為": 0.15,
+}
+
+# =========================
+# C. 件數型欄位的 hybrid 分箱
+#    保留低值單獨成箱，其餘尾端再 qcut
+# =========================
+COUNT_LIKE_BIN_CONFIG = {
+    "壽險保單數": [0, 1, 2, 3],
+    "保單數": [0, 1, 2],
+    "產險保單數": [0, 1],
+    "近1年保單數": [0, 1, 2],
+}
+
+# 
+benchmark_profile_for_rule = add_life_ratio_features(benchmark_profile_for_rule)
+candidate_profile_for_rule = add_life_ratio_features(candidate_profile_for_rule)
+
+
+# 建立所有欄位的 score table
+score_tables, bin_edges_dict = build_rule_score_tables(
+    benchmark_df=benchmark_profile_for_rule,
+    candidate_df=candidate_profile_for_rule,
+    feature_config=feature_config,
+    q=5,
+    min_total_count=30,
+    smoothing_k=10,
+    low_value_config=COUNT_LIKE_BIN_CONFIG
+)
+
+# 把 score table 套回 candidate，生成 rule score
+candidate_rule_scored_df = build_rule_score_from_profile(
+    profile_df=candidate_profile_for_rule,
+    feature_config=feature_config,
+    group_weights=group_weights,
+    score_tables=score_tables,
+    bin_edges_dict=bin_edges_dict,
+    id_col="被保人身分證字號"
+)
+
+# 5) 排序
+candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
+    "rule_score", ascending=False
+).reset_index(drop=True)
+
 # %% 看細節
 # 看 top candidate
 candidate_rule_scored_df[
@@ -532,155 +751,6 @@ with pd.ExcelWriter("rule_scoring_output.xlsx", engine="openpyxl") as writer:
     for feature_name, st in score_tables.items():
         sheet_name = f"score_{feature_name}"[:31]  # Excel sheet name 最長 31 字
         st.to_excel(writer, sheet_name=sheet_name, index=False)
-
-# %% 建 candidate pool
-def build_candidate_pool(
-    customer_df: pd.DataFrame,
-    require_positive_policy_cnt: bool = True
-):
-    df = customer_df.copy()
-    df.columns = df.columns.str.strip()
-
-    required_cols = ["被保人身分證字號", "是否曾買過躉繳投資型"]
-    missing_cols = [c for c in required_cols if c not in df.columns]
-    if missing_cols:
-        raise ValueError(f"customer_df 缺少必要欄位: {missing_cols}")
-
-    df["是否曾買過躉繳投資型"] = pd.to_numeric(
-        df["是否曾買過躉繳投資型"], errors="coerce"
-    )
-
-    funnel_records = []
-    funnel_records.append(["全部客戶", len(df)])
-
-    candidate_df = df[df["是否曾買過躉繳投資型"] == 0].copy()
-    funnel_records.append(["未買躉繳投資型", len(candidate_df)])
-
-    if require_positive_policy_cnt and "保單數" in candidate_df.columns:
-        before_cnt = len(candidate_df)
-        candidate_df = candidate_df[candidate_df["保單數"].fillna(0) > 0].copy()
-        funnel_records.append(["保單數 > 0", len(candidate_df)])
-        funnel_records.append(["因保單數<=0被排除", before_cnt - len(candidate_df)])
-
-    candidate_df["candidate標記"] = 1
-
-    funnel_df = pd.DataFrame(funnel_records, columns=["漏斗階段", "客戶數"])
-
-    return candidate_df, funnel_df
-
-candidate_df, funnel_df = build_candidate_pool(customer_df) # 看漏斗: funnel_df
-
-# %% 執行
-benchmark_profile_for_rule = benchmark_snapshot_df.copy()
-candidate_profile_for_rule = candidate_df.copy()
-
-# =========================
-# A. rule feature 設定
-# =========================
-feature_config = {
-    # 1) 壽險參與度
-    "壽險保單數": {
-        "group": "壽險參與度",
-        "feature_weight": 0.55,
-    },
-    "壽險保單占比": {
-        "group": "壽險參與度",
-        "feature_weight": 0.45,
-    },
-
-    # 2) 保費能力
-    "累計壽險保單總保費": {
-        "group": "保費能力",
-        "feature_weight": 0.45,
-    },
-    "壽險保費占比": {
-        "group": "保費能力",
-        "feature_weight": 0.30,
-    },
-    "累計保單總保費": {
-        "group": "保費能力",
-        "feature_weight": 0.25,
-    },
-
-    # 3) 關係深度
-    "保單數": {
-        "group": "關係深度",
-        "feature_weight": 0.70,
-    },
-    "產險保單數": {
-        "group": "關係深度",
-        "feature_weight": 0.30,
-    },
-
-    # 4) FYC結構
-    "累計壽險保單總繳款FYC": {
-        "group": "FYC結構",
-        "feature_weight": 0.60,
-    },
-    "壽險繳款FYC占比": {
-        "group": "FYC結構",
-        "feature_weight": 0.40,
-    },
-
-    # 5) 近期行為
-    "近1年保單數": {
-        "group": "近期行為",
-        "feature_weight": 1.00,
-    },
-}
-
-# =========================
-# B. 群組權重
-# =========================
-group_weights = {
-    "壽險參與度": 0.35,
-    "保費能力": 0.25,
-    "關係深度": 0.15,
-    "FYC結構": 0.10,
-    "近期行為": 0.15,
-}
-
-# =========================
-# C. 件數型欄位的 hybrid 分箱
-#    保留低值單獨成箱，其餘尾端再 qcut
-# =========================
-COUNT_LIKE_BIN_CONFIG = {
-    "壽險保單數": [0, 1, 3],
-    "保單數": [0, 1],
-    "產險保單數": [0, 1],
-    "近1年保單數": [0, 1, 2],
-}
-
-# 
-benchmark_profile_for_rule = add_life_ratio_features(benchmark_profile_for_rule)
-candidate_profile_for_rule = add_life_ratio_features(candidate_profile_for_rule)
-
-
-# 建立所有欄位的 score table
-score_tables, bin_edges_dict = build_rule_score_tables(
-    benchmark_df=benchmark_profile_for_rule,
-    candidate_df=candidate_profile_for_rule,
-    feature_config=feature_config,
-    q=5,
-    min_total_count=30,
-    smoothing_k=100,
-    low_value_config=COUNT_LIKE_BIN_CONFIG
-)
-
-# 把 score table 套回 candidate，生成 rule score
-candidate_rule_scored_df = build_rule_score_from_profile(
-    profile_df=candidate_profile_for_rule,
-    feature_config=feature_config,
-    group_weights=group_weights,
-    score_tables=score_tables,
-    bin_edges_dict=bin_edges_dict,
-    id_col="被保人身分證字號"
-)
-
-# 5) 排序
-candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
-    "rule_score", ascending=False
-).reset_index(drop=True)
 
 # %% 看結果
 candidate_rule_scored_df[
@@ -1013,7 +1083,7 @@ score_tables, bin_edges_dict = build_rule_score_tables(
     feature_config=feature_config,
     q=5,
     min_total_count=30,
-    smoothing_k=100,
+    smoothing_k=10,
     low_value_config=COUNT_LIKE_BIN_CONFIG
 )
 

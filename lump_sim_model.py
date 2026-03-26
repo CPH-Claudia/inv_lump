@@ -759,6 +759,9 @@ pd.concat([
     xgb_result["test_metrics"]
 ], axis=0)
 
+cols = ["roc_auc", "pr_auc", "top10_precision", "top20_precision", "lift_10", "lift_20"]
+xgb_auc = xgb_result["valid_metrics"][cols]
+xgb_auc_test = xgb_result["test_metrics"][cols]
 # %% 19-1. XGB feature importance
 xgb_model = xgb_result["model"]
 
@@ -1025,10 +1028,10 @@ output_cols = [
 output_cols = [c for c in output_cols if c in candidate_final_df.columns]
 candidate_output_df = candidate_final_df[output_cols].copy()
 
-print(candidate_output_df["名單等級"].value_counts(dropna=False))
+# print(candidate_output_df["名單等級"].value_counts(dropna=False))
 print(candidate_output_df.head(20))
 
-candidate_output_df.to_excel("candidate_final_score_output.xlsx", index=False)
+candidate_output_df.to_excel("D:/投資型/lump/final_score_output.xlsx", index=False)
 
 
 
