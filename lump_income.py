@@ -394,11 +394,131 @@ X_train_base, y_train_base, X_valid_base, y_valid_base, X_test_base, y_test_base
     train_df_balanced, valid_df, test_df, base_feature_cols, label_col="label"
 )
 
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+from sklearn.linear_model import LogisticRegression
+
+def train_logistic_baseline(X_train, y_train, X_valid, y_valid, X_test, y_test):
+    preprocessor, numeric_cols, categorical_cols = build_preprocessor(X_train)
+
+    clf = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("model", LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            random_state=42
+        ))
+    ])
+
+    clf.fit(X_train, y_train)
+
+    valid_prob = clf.predict_proba(X_valid)[:, 1]
+    test_prob = clf.predict_proba(X_test)[:, 1]
+
+    valid_metrics = evaluate_binary_model(y_valid, valid_prob, name="logistic_valid")
+    test_metrics = evaluate_binary_model(y_test, test_prob, name="logistic_test")
+
+    return {
+        "model": clf,
+        "valid_prob": valid_prob,
+        "test_prob": test_prob,
+        "valid_metrics": valid_metrics,
+        "test_metrics": test_metrics
+    }
+
 logit_base = train_logistic_baseline(
     X_train_base, y_train_base,
     X_valid_base, y_valid_base,
     X_test_base, y_test_base
 )
+
+def build_preprocessor(X_train: pd.DataFrame):
+    numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = [c for c in X_train.columns if c not in numeric_cols]
+
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median"))
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_cols),
+            ("cat", categorical_transformer, categorical_cols)
+        ]
+    )
+
+    return preprocessor, numeric_cols, categorical_cols
+
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_score
+from xgboost import XGBClassifier
+
+def top_k_precision(y_true, y_prob, top_pct=0.10):
+    df = pd.DataFrame({"y_true": y_true, "y_prob": y_prob}).sort_values("y_prob", ascending=False)
+    k = max(int(len(df) * top_pct), 1)
+    top_df = df.head(k)
+    return top_df["y_true"].mean()
+
+def evaluate_binary_model(y_true, y_prob, name="model"):
+    roc = roc_auc_score(y_true, y_prob)
+    pr = average_precision_score(y_true, y_prob)
+
+    p10 = top_k_precision(y_true, y_prob, top_pct=0.10)
+    p20 = top_k_precision(y_true, y_prob, top_pct=0.20)
+
+    out = pd.DataFrame([{
+        "model": name,
+        "roc_auc": roc,
+        "pr_auc": pr,
+        "top10_precision": p10,
+        "top20_precision": p20
+    }])
+    return out
+
+def train_xgboost_model(X_train, y_train, X_valid, y_valid, X_test, y_test):
+    preprocessor, numeric_cols, categorical_cols = build_preprocessor(X_train)
+
+    # 先 fit transform train，再 transform valid/test
+    X_train_t = preprocessor.fit_transform(X_train)
+    X_valid_t = preprocessor.transform(X_valid)
+    X_test_t = preprocessor.transform(X_test)
+
+    model = XGBClassifier(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=-1
+    )
+
+    model.fit(X_train_t, y_train)
+
+    valid_prob = model.predict_proba(X_valid_t)[:, 1]
+    test_prob = model.predict_proba(X_test_t)[:, 1]
+
+    valid_metrics = evaluate_binary_model(y_valid, valid_prob, name="xgb_valid")
+    test_metrics = evaluate_binary_model(y_test, test_prob, name="xgb_test")
+
+    return {
+        "preprocessor": preprocessor,
+        "model": model,
+        "valid_prob": valid_prob,
+        "test_prob": test_prob,
+        "valid_metrics": valid_metrics,
+        "test_metrics": test_metrics
+    }
 
 xgb_base = train_xgboost_model(
     X_train_base, y_train_base,
