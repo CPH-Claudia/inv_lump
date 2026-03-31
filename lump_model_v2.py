@@ -18,7 +18,7 @@ from xgboost import XGBClassifier
 
 
 # =========================================================
-# 基本欄位
+# %% 基本欄位
 # =========================================================
 ID_COL = "被保人身分證字號"
 POLICY_ID_COL = "保單申請案號"
@@ -35,7 +35,7 @@ HORIZON_DAYS = 365
 
 
 # =========================================================
-# 1. Snapshot 標記
+# %% 1. Snapshot 標記
 # =========================================================
 def build_positive_snapshot_dates(policy_df: pd.DataFrame,
                                   horizon_days: int = 365) -> pd.DataFrame:
@@ -140,7 +140,7 @@ def build_snapshot_master(policy_df: pd.DataFrame,
 
 
 # =========================================================
-# 2. Snapshot 特徵
+# %% 2. Snapshot 特徵
 # =========================================================
 def build_snapshot_features(policy_df: pd.DataFrame,
                             snapshot_master_df: pd.DataFrame) -> pd.DataFrame:
@@ -327,7 +327,7 @@ def add_snapshot_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# 3. 切資料 / 模型
+# %% 3. 切資料 / 模型
 # =========================================================
 def split_train_valid_test(snapshot_feature_df: pd.DataFrame):
     df = snapshot_feature_df.copy()
@@ -496,7 +496,7 @@ def train_xgboost_model(X_train, y_train, X_valid, y_valid, X_test, y_test):
 
 
 # =========================================================
-# 4. 主模型（A 路徑）
+# %% 4. 主模型（A 路徑）
 # =========================================================
 def get_model_feature_cols_main(df: pd.DataFrame):
     feature_cols = [
@@ -603,7 +603,7 @@ def run_main_model_pipeline(policy_df: pd.DataFrame):
 
 
 # =========================================================
-# 5. 收入模型（B 路徑）
+# %% 5. 收入模型（B 路徑）
 #    注意：只收「年收入有值」的 snapshot
 # =========================================================
 def get_mobile_customer_ids(raw_df: pd.DataFrame) -> set:
@@ -898,7 +898,7 @@ def run_income_model_pipeline_B(raw_df: pd.DataFrame, policy_df: pd.DataFrame):
 
 
 # =========================================================
-# 6. Candidate 打分：做法 B
+# %% 6. Candidate 打分：做法 B
 #    A 與 B 不重疊
 #    B 只有年收入有值者才納入
 # =========================================================
@@ -1156,13 +1156,42 @@ def score_candidates_with_model_B(candidate_rule_scored_df: pd.DataFrame,
 
     # ====== 排序 / 分群 / 主因 ======
     scored_df = scored_df.sort_values("final_score", ascending=False).reset_index(drop=True)
-
+    
+    # -------------------------------
+    # 1) 全體排名
+    # -------------------------------
     scored_df["final_rank"] = (
         scored_df["final_score"]
         .rank(method="first", ascending=False)
         .astype(int)
     )
     scored_df["final_rank_pct"] = scored_df["final_rank"] / len(scored_df)
+    
+    # -------------------------------
+    # 2) 分組內排名（依 is_income_B 分開）
+    #    0 = A_main_only / 無收入
+    #    1 = B_income_only / 有收入
+    # -------------------------------
+    scored_df["rank_by_group"] = (
+        scored_df.groupby("is_income_B")["final_score"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    
+    group_size = scored_df.groupby("is_income_B")[ID_COL].transform("count")
+    scored_df["rank_pct_by_group"] = scored_df["rank_by_group"] / group_size
+    
+    # -------------------------------
+    # 3) 依你的策略打 target flag
+    #    有收入：前20%
+    #    無收入：前10%
+    # -------------------------------
+    scored_df["target_flag"] = np.where(
+        ((scored_df["is_income_B"] == 1) & (scored_df["rank_pct_by_group"] <= 0.20)) |
+        ((scored_df["is_income_B"] == 0) & (scored_df["rank_pct_by_group"] <= 0.10)),
+        1, 0
+    )
+
 
     def assign_segment(p):
         if p <= 0.10:
@@ -1212,6 +1241,8 @@ def score_candidates_with_model_B(candidate_rule_scored_df: pd.DataFrame,
         "final_score",
         "final_rank",
         "final_rank_pct",
+        "rank_by_group",
+        "rank_pct_by_group",
         "名單等級",
         "推薦主因",
         "模型路徑",
@@ -1223,7 +1254,7 @@ def score_candidates_with_model_B(candidate_rule_scored_df: pd.DataFrame,
 
 
 # =========================================================
-# 7. 摘要 / 報表
+# %% 7. 摘要 / 報表
 # =========================================================
 def summarize_split(df: pd.DataFrame, split_name: str):
     total_n = len(df)
@@ -1252,7 +1283,7 @@ def summarize_model_splits(train_df, valid_df, test_df):
 
 
 # =========================================================
-# 8. 做法 B：模型結果摘要表
+# %% 8. 做法 B：模型結果摘要表
 # =========================================================
 
 def build_model_metrics_summary_B(main_pack: dict,
@@ -1430,7 +1461,9 @@ def export_modelB_report(main_pack: dict,
     
 
 
-# 執行
+
+
+# %% 執行
 main_pack = run_main_model_pipeline(policy_df)
 
 income_pack_B = run_income_model_pipeline_B(df_raw, policy_df)
@@ -1446,11 +1479,11 @@ candidate_output_B_df = score_candidates_with_model_B(
     model_weight=0.60
 )
 
-candidate_output_B_df.to_excel("D:/投資型/lump/candidate_output.xlsx", index=False)
+# candidate_output_B_df.to_excel("D:/投資型/lump/candidate_output.xlsx", index=False)
 
 candidate_output_B_df["模型路徑"].value_counts(dropna=False)
 candidate_output_B_df["名單等級"].value_counts(dropna=False)
-candidate_output_B_df.head(20)
+# candidate_output_B_df.head(20)
 
 
 export_modelB_report(
@@ -1461,7 +1494,14 @@ export_modelB_report(
 )
 
 
-# 評估 main model / income model
+
+
+
+
+
+
+
+# %% 評估 main model / income model
 compare_df = pd.concat([
     main_pack["xgb_result"]["test_metrics"].assign(model="main"),
     income_pack_B["xgb_result"]["test_metrics"].assign(model="income_B")
@@ -1506,7 +1546,7 @@ print("Income model:", income_eval)
 
 
 
-# 權重
+# %% 權重-Grid
 def find_best_weight(eval_df, rule_col="rule_score", model_col="model_prob_xgb"):
     results = []
 
@@ -1564,49 +1604,97 @@ unified_test_df["model_prob"] = unified_test_df["main_prob"]
 unified_test_df.loc[mask_income, "model_prob"] = unified_test_df.loc[mask_income, "income_prob"]
 
 # 假設你有 score_tables
-unified_test_df = apply_rule_score(unified_test_df, score_tables)
+# unified_test_df = apply_rule_score(unified_test_df, score_tables)
+
+unified_test_df = build_rule_score_from_profile(
+    profile_df=unified_test_df,
+    feature_config=feature_config,
+    group_weights=group_weights,
+    score_tables=score_tables,
+    bin_edges_dict=bin_edges_dict,
+    id_col="被保人身分證字號"
+)
+
 
 test_df = unified_test_df
 
 weight_df = find_best_weight(
     test_df,
-    rule_col="rule_score_norm",
+    rule_col="rule_score",
     model_col="model_prob"
 )
 
-print(weight_df.sort_values("top10_precision", ascending=False).head())
 
 
+# %% 評估 final score
 
 
-
-
-#
-# 假設 income_test_df 已經有：
-# label, main_prob, income_prob, rule_score
-
-rule_min = income_test_df["rule_score"].min()
-rule_max = income_test_df["rule_score"].max()
+rule_min = unified_test_df["rule_score"].min()
+rule_max = unified_test_df["rule_score"].max()
 
 if rule_max > rule_min:
-    income_test_df["rule_score_norm"] = (
-        (income_test_df["rule_score"] - rule_min) / (rule_max - rule_min)
+    unified_test_df["rule_score_norm"] = (
+        (unified_test_df["rule_score"] - rule_min) / (rule_max - rule_min)
     )
 else:
-    income_test_df["rule_score_norm"] = 0.5
+    unified_test_df["rule_score_norm"] = 0.5
 
 # 做法 B 的 final score（有收入者用 income model）
 RULE_WEIGHT = 0.40
 MODEL_WEIGHT = 0.60
 
-income_test_df["final_score"] = (
-    RULE_WEIGHT * income_test_df["rule_score_norm"] +
-    MODEL_WEIGHT * income_test_df["income_prob"]
+unified_test_df["final_score"] = (
+    RULE_WEIGHT * unified_test_df["rule_score_norm"] +
+    MODEL_WEIGHT * unified_test_df["income_prob"]
 )
 
 
-#
 
+
+# final score plot
+import matplotlib.pyplot as plt
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False
+
+data = unified_test_df["rule_score"].dropna()
+plt.figure(figsize=(8, 5))
+counts, bins, patches = plt.hist(data, bins=50, alpha=0.6)
+
+
+
+
+def summarize_top_segment(df, score_col="final_score", pct=0.3):
+    tmp = df.sort_values(score_col, ascending=False).reset_index(drop=True)
+
+    n = int(len(tmp) * pct)
+    seg = tmp.head(n)
+
+    result = {
+        "top_pct": pct,
+        "count": len(seg),
+        "avg_score": seg[score_col].mean(),
+        "median_score": seg[score_col].median(),
+        "min_score": seg[score_col].min(),
+        "max_score": seg[score_col].max(),
+        "p25": seg[score_col].quantile(0.25),
+        "p75": seg[score_col].quantile(0.75),
+    }
+
+    return pd.DataFrame([result])
+
+summary_30 = summarize_top_segment(candidate_output_B_df, "final_score", 0.3)
+print(summary_30)
+
+summary_df = pd.concat([
+    summarize_top_segment(candidate_output_B_df, "final_score", 0.1),
+    summarize_top_segment(candidate_output_B_df, "final_score", 0.2),
+    summarize_top_segment(candidate_output_B_df, "final_score", 0.3),
+], ignore_index=True)
+
+
+
+
+# %% 評估 main / income
 def build_cumulative_curve(df, score_col, label_col="label", n_bins=100):
     """
     依 score 排序後，計算 cumulative conversion rate curve
@@ -1640,9 +1728,9 @@ def build_cumulative_curve(df, score_col, label_col="label", n_bins=100):
     return perf
 
 
-curve_main = build_cumulative_curve(income_test_df, "main_prob")
-curve_income = build_cumulative_curve(income_test_df, "income_prob")
-curve_final = build_cumulative_curve(income_test_df, "final_score")
+curve_main = build_cumulative_curve(unified_test_df, "main_prob")
+curve_income = build_cumulative_curve(unified_test_df, "income_prob")
+curve_final = build_cumulative_curve(unified_test_df, "final_score")
 
 plt.figure(figsize=(8, 5))
 plt.plot(curve_main["population_pct"], curve_main["cum_conversion_rate"], label="Main model")
@@ -1657,6 +1745,7 @@ plt.legend()
 plt.show()
 
 
+# 
 def top_pct_conversion(df, score_col, label_col="label", p_list=[0.1, 0.2, 0.3]):
     tmp = df[[score_col, label_col]].dropna().copy()
     tmp = tmp.sort_values(score_col, ascending=False).reset_index(drop=True)
@@ -1673,11 +1762,10 @@ def top_pct_conversion(df, score_col, label_col="label", p_list=[0.1, 0.2, 0.3])
     return pd.DataFrame(results)
 
 top_compare_df = pd.concat([
-    top_pct_conversion(income_test_df, "main_prob"),
-    top_pct_conversion(income_test_df, "income_prob"),
-    top_pct_conversion(income_test_df, "final_score"),
+    top_pct_conversion(unified_test_df, "main_prob"),
+    top_pct_conversion(unified_test_df, "income_prob"),
+    top_pct_conversion(unified_test_df, "final_score"),
 ], axis=0, ignore_index=True)
 
-print(top_compare_df)
 
 

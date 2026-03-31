@@ -33,7 +33,7 @@ NEEDED_COLS = [
     "經紀人1", "經紀人1業代", "營業單位", "保險公司", "保險公司代碼"
 ]
 
-hyper_path = r"D:\投資型\lump\ipo_0306.hyper"
+hyper_path = r"D:\投資型\lump\ipo_0331.hyper"
 df_raw = pantab.frame_from_hyper(
     hyper_path,
     table=("Extract", "Extract")
