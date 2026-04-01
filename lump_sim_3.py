@@ -312,6 +312,133 @@ def build_rule_score_tables(
 
     return score_tables, bin_edges_dict
 
+# %% 年齡 / 性別分組 helper
+def make_age_group(series, age_bin_size=10):
+    s = pd.to_numeric(series, errors="coerce")
+    floor_age = np.floor(s / age_bin_size) * age_bin_size
+    lower = pd.Series(floor_age, index=series.index).astype("Int64").astype("string")
+    upper = (pd.Series(floor_age, index=series.index) + age_bin_size - 1).astype("Int64").astype("string")
+    out = lower + "-" + upper
+    return out.fillna("未知")
+
+
+def add_age_gender_group_for_rule(df: pd.DataFrame,
+                                  age_col: str = "被保人目前年齡_重算",
+                                  gender_col: str = "被保人性別",
+                                  age_bin_size: int = 10) -> pd.DataFrame:
+    out = df.copy()
+    out[gender_col] = out[gender_col].astype("string").fillna("未知")
+    out["age_group"] = make_age_group(out[age_col], age_bin_size=age_bin_size)
+    out["age_gender_group"] = out["age_group"].fillna("未知") + "_" + out[gender_col]
+    return out
+
+
+# %% 各 segment 建 score table
+def build_rule_score_tables_by_segment(
+    benchmark_df: pd.DataFrame,
+    candidate_df: pd.DataFrame,
+    feature_config: dict,
+    q: int = 5,
+    min_total_count: int = 30,
+    smoothing_k: int = 100,
+    low_value_config: dict = None,
+    segment_col: str = "age_gender_group",
+    min_segment_size: int = 200
+):
+    """
+    各年齡×性別 segment 各自建立 score table
+    若 segment 樣本太少，後續套分時 fallback 到 overall
+    """
+    segment_score_tables = {}
+    segment_bin_edges = {}
+
+    # 先建 overall fallback
+    overall_score_tables, overall_bin_edges = build_rule_score_tables(
+        benchmark_df=benchmark_df,
+        candidate_df=candidate_df,
+        feature_config=feature_config,
+        q=q,
+        min_total_count=min_total_count,
+        smoothing_k=smoothing_k,
+        low_value_config=low_value_config
+    )
+
+    benchmark_segments = set(benchmark_df[segment_col].dropna().astype("string").unique())
+    candidate_segments = set(candidate_df[segment_col].dropna().astype("string").unique())
+    all_segments = benchmark_segments | candidate_segments
+
+    for seg in all_segments:
+        bench_seg = benchmark_df[benchmark_df[segment_col].astype("string") == seg].copy()
+        cand_seg = candidate_df[candidate_df[segment_col].astype("string") == seg].copy()
+
+        if (len(bench_seg) + len(cand_seg)) < min_segment_size:
+            continue
+
+        seg_score_tables, seg_bin_edges = build_rule_score_tables(
+            benchmark_df=bench_seg,
+            candidate_df=cand_seg,
+            feature_config=feature_config,
+            q=q,
+            min_total_count=min_total_count,
+            smoothing_k=smoothing_k,
+            low_value_config=low_value_config
+        )
+
+        segment_score_tables[seg] = seg_score_tables
+        segment_bin_edges[seg] = seg_bin_edges
+
+    return {
+        "segment_score_tables": segment_score_tables,
+        "segment_bin_edges": segment_bin_edges,
+        "overall_score_tables": overall_score_tables,
+        "overall_bin_edges": overall_bin_edges
+    }
+
+
+# %% 依 segment 套 rule score
+def build_rule_score_from_profile_by_segment(
+    profile_df: pd.DataFrame,
+    feature_config: dict,
+    group_weights: dict,
+    segment_rulebook: dict,
+    id_col: str = "被保人身分證字號",
+    segment_col: str = "age_gender_group"
+):
+    df = profile_df.copy()
+
+    if id_col not in df.columns:
+        raise ValueError(f"profile_df 缺少必要欄位: {id_col}")
+    if segment_col not in df.columns:
+        raise ValueError(f"profile_df 缺少必要欄位: {segment_col}")
+
+    all_rows = []
+
+    for seg, sub_df in df.groupby(segment_col, dropna=False):
+        sub_df = sub_df.copy()
+
+        if seg in segment_rulebook["segment_score_tables"]:
+            score_tables = segment_rulebook["segment_score_tables"][seg]
+            bin_edges_dict = segment_rulebook["segment_bin_edges"][seg]
+            sub_df["rule_segment_source"] = "segment"
+        else:
+            score_tables = segment_rulebook["overall_score_tables"]
+            bin_edges_dict = segment_rulebook["overall_bin_edges"]
+            sub_df["rule_segment_source"] = "overall"
+
+        scored_sub = build_rule_score_from_profile(
+            profile_df=sub_df,
+            feature_config=feature_config,
+            group_weights=group_weights,
+            score_tables=score_tables,
+            bin_edges_dict=bin_edges_dict,
+            id_col=id_col
+        )
+
+        scored_sub[segment_col] = seg
+        all_rows.append(scored_sub)
+
+    out = pd.concat(all_rows, axis=0, ignore_index=True)
+    return out
 
 # %% 將 score table 套回 profile，產生 rule score
 def build_rule_score_from_profile(
@@ -511,60 +638,20 @@ candidate_df, funnel_df = build_candidate_pool(customer_df) # 看漏斗: funnel_
 benchmark_profile_for_rule = benchmark_snapshot_df.copy()
 candidate_profile_for_rule = candidate_df.copy()
 
+benchmark_profile_for_rule = add_life_ratio_features(benchmark_profile_for_rule)
+candidate_profile_for_rule = add_life_ratio_features(candidate_profile_for_rule)
+
+# 加入 age_gender_group
+benchmark_profile_for_rule = add_age_gender_group_for_rule(
+    benchmark_profile_for_rule,
+    age_col="被保人目前年齡_重算",
+    gender_col="被保人性別",
+    age_bin_size=10
+)
+
 # =========================
 # A. rule feature 設定
 # =========================
-# feature_config = {
-#     # 1) 壽險參與度
-#     "壽險保單數": {
-#         "group": "壽險參與度",
-#         "feature_weight": 0.55,
-#     },
-#     "壽險保單占比": {
-#         "group": "壽險參與度",
-#         "feature_weight": 0.45,
-#     },
-
-#     # 2) 保費能力
-#     "累計壽險保單總保費": {
-#         "group": "保費能力",
-#         "feature_weight": 0.45,
-#     },
-#     "壽險保費占比": {
-#         "group": "保費能力",
-#         "feature_weight": 0.30,
-#     },
-#     "累計保單總保費": {
-#         "group": "保費能力",
-#         "feature_weight": 0.25,
-#     },
-
-#     # 3) 關係深度
-#     "保單數": {
-#         "group": "關係深度",
-#         "feature_weight": 0.70,
-#     },
-#     "產險保單數": {
-#         "group": "關係深度",
-#         "feature_weight": 0.30,
-#     },
-
-#     # 4) FYC結構
-#     "累計壽險保單總繳款FYC": {
-#         "group": "FYC結構",
-#         "feature_weight": 0.60,
-#     },
-#     "壽險繳款FYC占比": {
-#         "group": "FYC結構",
-#         "feature_weight": 0.40,
-#     },
-
-#     # 5) 近期行為
-#     "近1年保單數": {
-#         "group": "近期行為",
-#         "feature_weight": 1.00,
-#     },
-# }
 
 feature_config = {
     # 1) 壽險參與度
@@ -636,7 +723,7 @@ group_weights = {
 COUNT_LIKE_BIN_CONFIG = {
     "壽險保單數": [0, 1, 2, 3],
     "保單數": [0, 1, 2],
-    "產險保單數": [0, 1],
+    "產險保單數": [0, 1, 2],
     "近1年保單數": [0, 1, 2],
 }
 
@@ -645,31 +732,75 @@ benchmark_profile_for_rule = add_life_ratio_features(benchmark_profile_for_rule)
 candidate_profile_for_rule = add_life_ratio_features(candidate_profile_for_rule)
 
 
-# 建立所有欄位的 score table
-score_tables, bin_edges_dict = build_rule_score_tables(
+# # 建立所有欄位的 score table
+# score_tables, bin_edges_dict = build_rule_score_tables(
+#     benchmark_df=benchmark_profile_for_rule,
+#     candidate_df=candidate_profile_for_rule,
+#     feature_config=feature_config,
+#     q=5,
+#     min_total_count=30,
+#     smoothing_k=10,
+#     low_value_config=COUNT_LIKE_BIN_CONFIG
+# )
+
+# 把 score table 套回 candidate，生成 rule score
+# candidate_rule_scored_df = build_rule_score_from_profile(
+#     profile_df=candidate_profile_for_rule,
+#     feature_config=feature_config,
+#     group_weights=group_weights,
+#     score_tables=score_tables,
+#     bin_edges_dict=bin_edges_dict,
+#     id_col="被保人身分證字號"
+# )
+
+# # 5) 排序
+# candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
+#     "rule_score", ascending=False
+# ).reset_index(drop=True)
+
+
+
+
+
+candidate_profile_for_rule = add_age_gender_group_for_rule(
+    candidate_profile_for_rule,
+    age_col="被保人目前年齡_重算",
+    gender_col="被保人性別",
+    age_bin_size=10
+)
+
+# 建 segmented rulebook
+segment_rulebook = build_rule_score_tables_by_segment(
     benchmark_df=benchmark_profile_for_rule,
     candidate_df=candidate_profile_for_rule,
     feature_config=feature_config,
     q=5,
     min_total_count=30,
     smoothing_k=10,
-    low_value_config=COUNT_LIKE_BIN_CONFIG
+    low_value_config=COUNT_LIKE_BIN_CONFIG,
+    segment_col="age_gender_group",
+    min_segment_size=200
 )
 
-# 把 score table 套回 candidate，生成 rule score
-candidate_rule_scored_df = build_rule_score_from_profile(
+# 套用 segmented rule score
+candidate_rule_scored_df = build_rule_score_from_profile_by_segment(
     profile_df=candidate_profile_for_rule,
     feature_config=feature_config,
     group_weights=group_weights,
-    score_tables=score_tables,
-    bin_edges_dict=bin_edges_dict,
-    id_col="被保人身分證字號"
+    segment_rulebook=segment_rulebook,
+    id_col="被保人身分證字號",
+    segment_col="age_gender_group"
 )
 
-# 5) 排序
+# 排序
 candidate_rule_scored_df = candidate_rule_scored_df.sort_values(
     "rule_score", ascending=False
 ).reset_index(drop=True)
+
+# 如果後面還有用到 score_tables / bin_edges_dict（例如 unified_test_df 權重搜索）
+# 這裡保留 overall 作為全體 fallback
+score_tables = segment_rulebook["overall_score_tables"]
+bin_edges_dict = segment_rulebook["overall_bin_edges"]
 
 # %% 看細節
 # 看 top candidate
@@ -723,9 +854,9 @@ def build_rulebook_df(score_tables: dict) -> pd.DataFrame:
 
     rulebook_df = pd.concat(all_tables, axis=0, ignore_index=True)
 
-    # 排序（先 feature，再分數）
-    if "分數" in rulebook_df.columns:
-        rulebook_df = rulebook_df.sort_values(["feature", "分數"], ascending=[True, False])
+    # # 排序（先 feature，再分數）
+    # if "分數" in rulebook_df.columns:
+    #     rulebook_df = rulebook_df.sort_values(["feature", "分數"], ascending=[True, False])
 
     return rulebook_df
 
@@ -769,6 +900,7 @@ candidate_rule_scored_df[
 # 檢查每個欄位的 score table
 score_tables["保單數"]
 score_tables["壽險保單數"]
+產險保單數 = score_tables["產險保單數"]
 score_tables["累計壽險保單總保費"]
 
 # 看 top rule score 客群輪廓

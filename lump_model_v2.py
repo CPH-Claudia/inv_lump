@@ -235,6 +235,13 @@ def build_snapshot_features(policy_df: pd.DataFrame,
     for c in optional_nunique_cols:
         if c in hist_df.columns:
             agg_dict[c] = pd.Series.nunique
+            
+        # 客戶靜態欄位：性別 / 生日
+    if "被保人性別" in hist_df.columns:
+        agg_dict["被保人性別"] = "last"
+
+    if "被保人生日" in hist_df.columns:
+        agg_dict["被保人生日"] = "first"
 
     feat_df = hist_df.groupby(group_keys, dropna=False).agg(agg_dict)
 
@@ -313,6 +320,27 @@ def build_snapshot_features(policy_df: pd.DataFrame,
             feat_df["累計保單總繳款FYC"] > 0,
             feat_df["累計壽險保單總繳款FYC"] / feat_df["累計保單總繳款FYC"],
             np.nan
+        )
+        
+    # =========================
+    # 年齡 / 性別特徵
+    # =========================
+    if {"被保人生日", "snapshot_date"}.issubset(feat_df.columns):
+        feat_df["snapshot_age"] = np.floor(
+            (pd.to_datetime(feat_df["snapshot_date"]) - pd.to_datetime(feat_df["被保人生日"])).dt.days / 365.25
+        )
+
+        floor_age = np.floor(feat_df["snapshot_age"] / 10) * 10
+        lower = pd.Series(floor_age, index=feat_df.index).astype("Int64").astype("string")
+        upper = (pd.Series(floor_age, index=feat_df.index) + 9).astype("Int64").astype("string")
+        feat_df["age_group"] = (lower + "-" + upper).fillna("未知")
+
+    if "被保人性別" in feat_df.columns:
+        feat_df["被保人性別"] = feat_df["被保人性別"].astype("string").fillna("未知")
+
+    if {"age_group", "被保人性別"}.issubset(feat_df.columns):
+        feat_df["age_gender_group"] = (
+            feat_df["age_group"].fillna("未知") + "_" + feat_df["被保人性別"]
         )
 
     return feat_df
@@ -501,6 +529,9 @@ def train_xgboost_model(X_train, y_train, X_valid, y_valid, X_test, y_test):
 def get_model_feature_cols_main(df: pd.DataFrame):
     feature_cols = [
         "保單數",
+        "snapshot_age",
+        "age_group",
+        "被保人性別",
         "壽險保單數",
         "產險保單數",
         "壽險保單占比",
@@ -966,6 +997,36 @@ def add_snapshot_proxy_for_candidate(candidate_df: pd.DataFrame) -> pd.DataFrame
     out = add_snapshot_calendar_features(out)
     return out
 
+def add_age_gender_group(df: pd.DataFrame,
+                         birth_col: str = "被保人生日",
+                         gender_col: str = "被保人性別",
+                         ref_date_col: str = "snapshot_date",
+                         age_bin_size: int = 10) -> pd.DataFrame:
+    out = df.copy()
+
+    out[birth_col] = pd.to_datetime(out[birth_col], errors="coerce")
+    out[ref_date_col] = pd.to_datetime(out[ref_date_col], errors="coerce")
+
+    # 若已經有目前年齡，優先沿用；否則用生日 + snapshot_date 重算
+    if "被保人目前年齡_重算" in out.columns:
+        age_series = pd.to_numeric(out["被保人目前年齡_重算"], errors="coerce")
+    else:
+        age_series = np.floor((out[ref_date_col] - out[birth_col]).dt.days / 365.25)
+
+    out["group_age"] = age_series
+
+    floor_age = np.floor(out["group_age"] / age_bin_size) * age_bin_size
+    lower = pd.Series(floor_age, index=out.index).astype("Int64").astype("string")
+    upper = (pd.Series(floor_age, index=out.index) + age_bin_size - 1).astype("Int64").astype("string")
+
+    out["age_group"] = lower + "-" + upper
+    out["age_group"] = out["age_group"].fillna("未知")
+
+    out["gender_group"] = out[gender_col].astype("string").fillna("未知")
+    out["age_gender_group"] = out["age_group"] + "_" + out["gender_group"]
+
+    return out
+
 
 def build_candidate_income_features_B(raw_df: pd.DataFrame,
                                       candidate_df: pd.DataFrame) -> pd.DataFrame:
@@ -1040,6 +1101,7 @@ def score_candidates_with_model_B(candidate_rule_scored_df: pd.DataFrame,
     # 補主模型共用特徵
     candidate_df = add_missing_main_model_features(candidate_df, policy_df)
     candidate_df = add_snapshot_proxy_for_candidate(candidate_df)
+    candidate_df = add_age_gender_group(candidate_df, age_bin_size=10)
 
     # 補收入特徵
     candidate_df = build_candidate_income_features_B(raw_df, candidate_df)
@@ -1247,6 +1309,10 @@ def score_candidates_with_model_B(candidate_rule_scored_df: pd.DataFrame,
         "推薦主因",
         "模型路徑",
         "is_income_B"
+        "被保人性別",
+        "snapshot_age",
+        "age_group",
+        "age_gender_group",
     ]
     output_cols = [c for c in output_cols if c in scored_df.columns]
 
@@ -1490,7 +1556,7 @@ export_modelB_report(
     main_pack=main_pack,
     income_pack_B=income_pack_B,
     candidate_output_B_df=candidate_output_B_df,
-    output_path="D:/投資型/lump/modelB_report.xlsx"
+    output_path="D:/投資型/lump/model_report_0401.xlsx"
 )
 
 
