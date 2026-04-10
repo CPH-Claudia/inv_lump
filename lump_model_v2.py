@@ -1305,10 +1305,11 @@ def score_candidates_with_model_B(candidate_rule_scored_df: pd.DataFrame,
         "final_rank_pct",
         "rank_by_group",
         "rank_pct_by_group",
+        "target_flag",  
         "名單等級",
         "推薦主因",
         "模型路徑",
-        "is_income_B"
+        "is_income_B", 
         "被保人性別",
         "snapshot_age",
         "age_group",
@@ -1501,13 +1502,19 @@ def build_candidate_scoring_summary_B(candidate_output_B_df: pd.DataFrame) -> pd
             "value": int(candidate_output_B_df["income_model_prob_xgb"].notna().sum())
         })
 
+    if "target_flag" in candidate_output_B_df.columns:
+        rows.append({
+            "metric": "target_flag_count",
+            "value": int((candidate_output_B_df["target_flag"] == 1).sum())
+        })
+
     return pd.DataFrame(rows)
 
 
 def export_modelB_report(main_pack: dict,
                          income_pack_B: dict,
                          candidate_output_B_df: pd.DataFrame,
-                         output_path: str = "modelB_report.xlsx"):
+                         output_path: str = "D:/投資型/lump/modelB_report.xlsx"):
     """
     輸出做法 B 的完整報表
     """
@@ -1524,6 +1531,9 @@ def export_modelB_report(main_pack: dict,
         candidate_output_B_df.to_excel(writer, sheet_name="candidate_output", index=False)
 
     print(f"做法 B 報表已輸出：{output_path}")
+
+
+
     
 
 
@@ -1545,24 +1555,655 @@ candidate_output_B_df = score_candidates_with_model_B(
     model_weight=0.60
 )
 
-# candidate_output_B_df.to_excel("D:/投資型/lump/candidate_output.xlsx", index=False)
-
 candidate_output_B_df["模型路徑"].value_counts(dropna=False)
 candidate_output_B_df["名單等級"].value_counts(dropna=False)
-# candidate_output_B_df.head(20)
 
 
-export_modelB_report(
-    main_pack=main_pack,
-    income_pack_B=income_pack_B,
+# export_modelB_report(
+#     main_pack=main_pack,
+#     income_pack_B=income_pack_B,
+#     candidate_output_B_df=candidate_output_B_df,
+#     output_path="D:/投資型/lump/model_report_0407.xlsx"
+# )
+
+
+
+# %% 輸出 batch_1 ~ batch_5 客戶名單
+
+def export_selected_batches_from_candidate_output(
+    candidate_output_B_df: pd.DataFrame,
+    output_path: str,
+    agent_col: str = "目前經紀人1業代",
+    score_col: str = "final_score",
+    route_col: str = "模型路徑",
+    id_col: str = "被保人身分證字號",
+    batch_size: int = 20,
+    max_batches: int = 5
+):
+    """
+    根據做法 B 的 candidate_output_B_df：
+    1. A_main_only 取前10%
+    2. B_income_only 取前20%
+    3. 每位業務再切 batch（每批20）
+    4. 每位業務最多保留前5個batch（共100人）
+    5. 輸出同一份 Excel
+    """
+
+    df = candidate_output_B_df.copy()
+    df.columns = df.columns.str.strip()
+
+    required_cols = [agent_col, score_col, route_col, id_col]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"candidate_output_B_df 缺少必要欄位: {missing_cols}")
+
+    # 基本清理
+    df[agent_col] = df[agent_col].astype("string").fillna("未知業務")
+    df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+    df[route_col] = df[route_col].astype("string")
+    df[id_col] = df[id_col].astype("string")
+
+    df = df[df[score_col].notna()].copy()
+
+    # =====================================================
+    # 1. 依模型路徑做 cutoff
+    #    A_main_only -> 前10%
+    #    B_income_only -> 前20%
+    # =====================================================
+    df = df.sort_values([route_col, score_col], ascending=[True, False]).reset_index(drop=True)
+
+    df["rank_pct_by_route"] = (
+        df.groupby(route_col)[score_col]
+        .rank(method="first", ascending=False, pct=True)
+    )
+
+    df["is_selected_by_route"] = 0
+
+    df.loc[
+        (df[route_col] == "A_main_only") & (df["rank_pct_by_route"] <= 0.10),
+        "is_selected_by_route"
+    ] = 1
+
+    df.loc[
+        (df[route_col] == "B_income_only") & (df["rank_pct_by_route"] <= 0.20),
+        "is_selected_by_route"
+    ] = 1
+
+    selected_df = df[df["is_selected_by_route"] == 1].copy()
+
+    # =====================================================
+    # 2. 每位業務內排序
+    # =====================================================
+    selected_df = selected_df.sort_values(
+        [agent_col, score_col, id_col],
+        ascending=[True, False, True]
+    ).reset_index(drop=True)
+
+    selected_df["rank_by_agent"] = (
+        selected_df.groupby(agent_col)[score_col]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+
+    # =====================================================
+    # 3. 每位業務切 batch
+    # =====================================================
+    selected_df["release_batch"] = np.ceil(selected_df["rank_by_agent"] / batch_size).astype(int)
+
+    # 每位業務最多前 max_batches 個 batch
+    selected_df = selected_df[selected_df["release_batch"] <= max_batches].copy()
+
+    selected_df["is_first_batch"] = (selected_df["release_batch"] == 1).astype(int)
+
+    # 業務最終名單數 / 批次數
+    selected_df["agent_total_selected"] = selected_df.groupby(agent_col)[id_col].transform("count")
+    selected_df["agent_total_batches"] = selected_df.groupby(agent_col)["release_batch"].transform("max")
+
+    # =====================================================
+    # 4. Agent summary
+    # =====================================================
+    agent_summary_df = (
+        selected_df.groupby(agent_col, dropna=False)
+        .agg(
+            total_selected=(id_col, "count"),
+            total_batches=("release_batch", "max"),
+            first_batch_count=("is_first_batch", "sum"),
+            avg_score=(score_col, "mean"),
+            median_score=(score_col, "median"),
+            max_score=(score_col, "max"),
+            min_score=(score_col, "min"),
+            income_route_count=(route_col, lambda s: (s == "B_income_only").sum()),
+            main_route_count=(route_col, lambda s: (s == "A_main_only").sum())
+        )
+        .reset_index()
+        .sort_values(["total_selected", "avg_score"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+    # =====================================================
+    # 5. 每個 batch 的完整名單
+    # =====================================================
+    batch_dfs = {}
+    for b in range(1, max_batches + 1):
+        batch_df = (
+            selected_df[selected_df["release_batch"] == b]
+            .copy()
+            .sort_values([agent_col, "rank_by_agent"])
+            .reset_index(drop=True)
+        )
+        batch_dfs[b] = batch_df
+
+    # =====================================================
+    # 6. 欄位順序整理
+    # =====================================================
+    front_cols = [
+        agent_col,
+        id_col,
+        "release_batch",
+        "rank_by_agent",
+        "agent_total_selected",
+        "agent_total_batches",
+        route_col,
+        "rank_pct_by_route",
+        score_col,
+        "final_rank" if "final_rank" in selected_df.columns else None,
+        "final_rank_pct" if "final_rank_pct" in selected_df.columns else None,
+        "rank_by_group" if "rank_by_group" in selected_df.columns else None,
+        "rank_pct_by_group" if "rank_pct_by_group" in selected_df.columns else None,
+        "rule_score" if "rule_score" in selected_df.columns else None,
+        "rule_score_norm" if "rule_score_norm" in selected_df.columns else None,
+        "model_prob_xgb" if "model_prob_xgb" in selected_df.columns else None,
+        "income_model_prob_xgb" if "income_model_prob_xgb" in selected_df.columns else None,
+        "snapshot_年收入_合成_萬" if "snapshot_年收入_合成_萬" in selected_df.columns else None,
+        "age_group" if "age_group" in selected_df.columns else None,
+        "age_gender_group" if "age_gender_group" in selected_df.columns else None,
+        "名單等級" if "名單等級" in selected_df.columns else None,
+        "推薦主因" if "推薦主因" in selected_df.columns else None,
+        "target_flag" if "target_flag" in selected_df.columns else None,
+    ]
+    front_cols = [c for c in front_cols if c is not None and c in selected_df.columns]
+    other_cols = [c for c in selected_df.columns if c not in front_cols]
+
+    selected_df = selected_df[front_cols + other_cols]
+
+    for b in batch_dfs:
+        batch_dfs[b] = batch_dfs[b][[c for c in selected_df.columns if c in batch_dfs[b].columns]]
+
+    # =====================================================
+    # 7. 輸出 Excel
+    # =====================================================
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        selected_df.to_excel(writer, sheet_name="all_selected", index=False)
+        agent_summary_df.to_excel(writer, sheet_name="agent_summary", index=False)
+
+        for b in range(1, max_batches + 1):
+            batch_dfs[b].to_excel(writer, sheet_name=f"batch_{b}", index=False)
+
+    print(f"已輸出 Excel：{output_path}")
+    print(f"原始 candidate 數：{len(df):,}")
+    print(f"cutoff 後名單數：{len(selected_df):,}")
+    print(f"業務數：{selected_df[agent_col].nunique():,}")
+
+    return {
+        "selected_df": selected_df,
+        "agent_summary_df": agent_summary_df,
+        "batch_dfs": batch_dfs
+    }
+
+
+# ===== 執行 =====
+result_pack = export_selected_batches_from_candidate_output(
     candidate_output_B_df=candidate_output_B_df,
-    output_path="D:/投資型/lump/model_report_0401.xlsx"
+    output_path="D:/投資型/lump/final_batches_0407.xlsx",
+    agent_col="目前經紀人1業代",
+    score_col="final_score",
+    route_col="模型路徑",
+    id_col="被保人身分證字號",
+    batch_size=20,
+    max_batches=5
 )
 
 
+# %% 重算業務客戶數 + 輸出batchs
+# 客戶名單展開業務
+def build_customer_agent_map_from_policy(
+    policy_df: pd.DataFrame,
+    customer_id_col: str = "被保人身分證字號",
+    agent_col: str = "目前經紀人1業代"
+) -> pd.DataFrame:
+    """
+    從 policy_df 建立 客戶 × 業務 對照表
+    """
+    df = policy_df.copy()
+    df.columns = df.columns.str.strip()
+
+    required_cols = [customer_id_col, agent_col]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"policy_df 缺少必要欄位: {missing_cols}")
+
+    df[customer_id_col] = df[customer_id_col].astype("string")
+    df[agent_col] = df[agent_col].astype("string")
+
+    map_df = (
+        df[[customer_id_col, agent_col]]
+        .dropna()
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    return map_df
+
+
+# 依所有業務展開名單切batch
+# def build_agent_batch_candidates(
+#     candidate_output_B_df: pd.DataFrame,
+#     customer_agent_map_df: pd.DataFrame,
+#     customer_id_col: str = "被保人身分證字號",
+#     agent_col: str = "目前經紀人1業代",
+#     score_col: str = "final_score",
+#     route_col: str = "模型路徑",
+#     batch_size: int = 20,
+#     max_batch: int = 5
+# ) -> dict:
+#     """
+#     1. 將 candidate 名單展開成 客戶 × 所有業務
+#     2. 依模型路徑做 cutoff
+#        - A_main_only -> 前10%
+#        - B_income_only -> 前20%
+#     3. 依每個業務內 final_score 排序
+#     4. 每 20 筆切一個 batch
+#     5. 只保留前 max_batch 批
+#     """
+
+#     cand = candidate_output_B_df.copy()
+#     cand.columns = cand.columns.str.strip()
+
+#     map_df = customer_agent_map_df.copy()
+#     map_df.columns = map_df.columns.str.strip()
+
+#     required_cand_cols = [customer_id_col, score_col, route_col]
+#     missing_cand_cols = [c for c in required_cand_cols if c not in cand.columns]
+#     if missing_cand_cols:
+#         raise ValueError(f"candidate_output_B_df 缺少必要欄位: {missing_cand_cols}")
+
+#     required_map_cols = [customer_id_col, agent_col]
+#     missing_map_cols = [c for c in required_map_cols if c not in map_df.columns]
+#     if missing_map_cols:
+#         raise ValueError(f"customer_agent_map_df 缺少必要欄位: {missing_map_cols}")
+
+#     cand[customer_id_col] = cand[customer_id_col].astype("string")
+#     map_df[customer_id_col] = map_df[customer_id_col].astype("string")
+#     map_df[agent_col] = map_df[agent_col].astype("string")
+
+#     cand[score_col] = pd.to_numeric(cand[score_col], errors="coerce")
+#     cand = cand[cand[score_col].notna()].copy()
+
+#     # 1) 將名單客戶對應到所有業務
+#     expanded_df = cand.merge(
+#         map_df[[customer_id_col, agent_col]].drop_duplicates(),
+#         on=customer_id_col,
+#         how="left"
+#     )
+
+#     expanded_df[agent_col] = expanded_df[agent_col].fillna("未知業務")
+
+#     # 2) 依模型路徑做 cutoff
+#     expanded_df = expanded_df.sort_values([route_col, score_col], ascending=[True, False]).reset_index(drop=True)
+
+#     expanded_df["rank_pct_by_route"] = (
+#         expanded_df.groupby(route_col)[score_col]
+#         .rank(method="first", ascending=False, pct=True)
+#     )
+
+#     expanded_df["is_selected_by_route"] = 0
+
+#     expanded_df.loc[
+#         (expanded_df[route_col] == "A_main_only") &
+#         (expanded_df["rank_pct_by_route"] <= 0.10),
+#         "is_selected_by_route"
+#     ] = 1
+
+#     expanded_df.loc[
+#         (expanded_df[route_col] == "B_income_only") &
+#         (expanded_df["rank_pct_by_route"] <= 0.20),
+#         "is_selected_by_route"
+#     ] = 1
+
+#     selected_df = expanded_df[expanded_df["is_selected_by_route"] == 1].copy()
+
+#     # 3) 依每個業務內 final_score 排序
+#     selected_df = selected_df.sort_values(
+#         [agent_col, score_col, customer_id_col],
+#         ascending=[True, False, True]
+#     ).reset_index(drop=True)
+
+#     selected_df["rank_by_agent"] = (
+#         selected_df.groupby(agent_col)[score_col]
+#         .rank(method="first", ascending=False)
+#         .astype(int)
+#     )
+
+#     # 4) 每 20 筆切一個 batch
+#     selected_df["batch"] = np.ceil(selected_df["rank_by_agent"] / batch_size).astype(int)
+#     selected_df["釋出批次"] = selected_df["batch"]
+
+#     # 5) 只保留前 max_batch 批
+#     selected_df = selected_df[selected_df["batch"] <= max_batch].copy()
+
+#     # 每個業務各 batch 有幾個人
+#     batch_count_wide = (
+#         selected_df.groupby([agent_col, "batch"], dropna=False)[customer_id_col]
+#         .size()
+#         .unstack(fill_value=0)
+#         .reindex(columns=range(1, max_batch + 1), fill_value=0)
+#         .reset_index()
+#     )
+#     batch_count_wide.columns = [agent_col] + [f"batch_{i}_count" for i in range(1, max_batch + 1)]
+
+#     # 每位業務摘要
+#     agent_summary_df = (
+#         selected_df.groupby(agent_col, dropna=False)
+#         .agg(
+#             客戶數=(customer_id_col, "nunique"),
+#             名單筆數=(customer_id_col, "size"),
+#             批次數=("batch", "max"),
+#             平均分數=(score_col, "mean"),
+#             中位數分數=(score_col, "median"),
+#             最高分數=(score_col, "max"),
+#             最低分數=(score_col, "min")
+#         )
+#         .reset_index()
+#     )
+
+#     agent_summary_df = agent_summary_df.merge(
+#         batch_count_wide,
+#         on=agent_col,
+#         how="left"
+#     )
+
+#     agent_summary_df = agent_summary_df.sort_values(
+#         ["名單筆數", "平均分數"],
+#         ascending=[False, False]
+#     ).reset_index(drop=True)
+
+#     # 每批完整名單（只建到 batch_5）
+#     batch_dfs = {}
+#     for b in range(1, max_batch + 1):
+#         batch_dfs[b] = (
+#             selected_df[selected_df["batch"] == b]
+#             .sort_values([agent_col, "rank_by_agent"])
+#             .reset_index(drop=True)
+#         )
+
+#     return {
+#         "selected_df": selected_df,
+#         "agent_summary_df": agent_summary_df,
+#         "batch_dfs": batch_dfs
+#     }
+
+
+# # 輸出
+# def export_agent_batches_excel(
+#     batch_pack: dict,
+#     output_path: str,
+#     agent_col: str = "目前經紀人1業代",
+#     max_batch: int = 5
+# ):
+#     selected_df = batch_pack["selected_df"].copy()
+#     agent_summary_df = batch_pack["agent_summary_df"].copy()
+#     batch_dfs = batch_pack["batch_dfs"]
+
+#     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+#         selected_df.to_excel(writer, sheet_name="all_selected_expanded", index=False)
+#         agent_summary_df.to_excel(writer, sheet_name="agent_summary", index=False)
+
+#         for b in range(1, max_batch + 1):
+#             batch_df = batch_dfs.get(b, pd.DataFrame())
+#             batch_df.to_excel(writer, sheet_name=f"batch_{b}", index=False)
+
+#     print(f"已輸出：{output_path}")
+#     print(f"總名單筆數（展開後）: {len(selected_df):,}")
+#     print(f"業務數: {selected_df[agent_col].nunique():,}")
+#     print(f"輸出批次: 1 ~ {max_batch}")
+    
+
+# # 執行
+# # 先建立 客戶 × 業務 對照表
+# customer_agent_map_df = build_customer_agent_map_from_policy(
+#     policy_df=policy_df,
+#     customer_id_col="被保人身分證字號",
+#     agent_col="經紀人1業代"
+# )
+
+# # 產生展開後名單 + 業務 batch
+# batch_pack = build_agent_batch_candidates(
+#     candidate_output_B_df=candidate_output_B_df,
+#     customer_agent_map_df=customer_agent_map_df,
+#     customer_id_col="被保人身分證字號",
+#     agent_col="經紀人1業代",
+#     score_col="final_score",
+#     route_col="模型路徑",
+#     batch_size=20, 
+#     max_batch=5
+# )
+
+# # 輸出 Excel
+# export_agent_batches_excel(
+#     batch_pack=batch_pack,
+#     output_path="D:/投資型/lump/final_agent_batches_0408.xlsx",
+#     agent_col="經紀人1業代", 
+#     max_batch=5
+# )
 
 
 
+
+def build_agent_batch_candidates_customer_level(
+    candidate_output_B_df: pd.DataFrame,
+    customer_agent_map_df: pd.DataFrame,
+    customer_id_col: str = "被保人身分證字號",
+    agent_col: str = "目前經紀人1業代",
+    score_col: str = "final_score",
+    route_col: str = "模型路徑",
+    batch_size: int = 20,
+    max_batch: int = 5
+) -> dict:
+    """
+    新邏輯：
+    1. 先在客戶層做 cutoff
+       - A_main_only -> 前10%
+       - B_income_only -> 前20%
+    2. 在客戶層排序並決定第幾批釋出
+    3. 再展開成 客戶 × 所有業務
+    4. 所有曾服務過該客戶的業務，都拿到同一批次的客戶
+    """
+
+    cand = candidate_output_B_df.copy()
+    cand.columns = cand.columns.str.strip()
+
+    map_df = customer_agent_map_df.copy()
+    map_df.columns = map_df.columns.str.strip()
+
+    required_cand_cols = [customer_id_col, score_col, route_col]
+    missing_cand_cols = [c for c in required_cand_cols if c not in cand.columns]
+    if missing_cand_cols:
+        raise ValueError(f"candidate_output_B_df 缺少必要欄位: {missing_cand_cols}")
+
+    required_map_cols = [customer_id_col, agent_col]
+    missing_map_cols = [c for c in required_map_cols if c not in map_df.columns]
+    if missing_map_cols:
+        raise ValueError(f"customer_agent_map_df 缺少必要欄位: {missing_map_cols}")
+
+    cand[customer_id_col] = cand[customer_id_col].astype("string")
+    map_df[customer_id_col] = map_df[customer_id_col].astype("string")
+    map_df[agent_col] = map_df[agent_col].astype("string")
+
+    cand[score_col] = pd.to_numeric(cand[score_col], errors="coerce")
+    cand = cand[cand[score_col].notna()].copy()
+
+    # =====================================================
+    # 1. 客戶層 cutoff
+    # =====================================================
+    cand = cand.sort_values([route_col, score_col], ascending=[True, False]).reset_index(drop=True)
+
+    cand["rank_pct_by_route"] = (
+        cand.groupby(route_col)[score_col]
+        .rank(method="first", ascending=False, pct=True)
+    )
+
+    cand["is_selected_by_route"] = 0
+
+    cand.loc[
+        (cand[route_col] == "A_main_only") &
+        (cand["rank_pct_by_route"] <= 0.10),
+        "is_selected_by_route"
+    ] = 1
+
+    cand.loc[
+        (cand[route_col] == "B_income_only") &
+        (cand["rank_pct_by_route"] <= 0.20),
+        "is_selected_by_route"
+    ] = 1
+
+    selected_customer_df = cand[cand["is_selected_by_route"] == 1].copy()
+
+    # =====================================================
+    # 2. 客戶層排序 + 批次
+    # =====================================================
+    selected_customer_df = selected_customer_df.sort_values(
+        [score_col, customer_id_col],
+        ascending=[False, True]
+    ).reset_index(drop=True)
+
+    selected_customer_df["customer_rank"] = np.arange(1, len(selected_customer_df) + 1)
+    selected_customer_df["batch"] = np.ceil(selected_customer_df["customer_rank"] / batch_size).astype(int)
+    selected_customer_df["釋出批次"] = selected_customer_df["batch"]
+
+    # 最多只保留前 max_batch 批
+    selected_customer_df = selected_customer_df[selected_customer_df["batch"] <= max_batch].copy()
+
+    # =====================================================
+    # 3. 展開成 客戶 × 所有業務
+    # =====================================================
+    expanded_df = selected_customer_df.merge(
+        map_df[[customer_id_col, agent_col]].drop_duplicates(),
+        on=customer_id_col,
+        how="left"
+    )
+
+    expanded_df[agent_col] = expanded_df[agent_col].fillna("未知業務")
+
+    # =====================================================
+    # 4. 業務內資訊（注意：這裡不再決定 batch）
+    #    只計算該業務收到的名單順序，方便看名單
+    # =====================================================
+    expanded_df = expanded_df.sort_values(
+        [agent_col, "batch", score_col, customer_id_col],
+        ascending=[True, True, False, True]
+    ).reset_index(drop=True)
+
+    expanded_df["rank_within_agent"] = (
+        expanded_df.groupby(agent_col)[score_col]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+
+    # =====================================================
+    # 5. 每位業務摘要（看每批有幾個人）
+    # =====================================================
+    batch_count_wide = (
+        expanded_df.groupby([agent_col, "batch"], dropna=False)[customer_id_col]
+        .nunique()
+        .unstack(fill_value=0)
+        .reindex(columns=range(1, max_batch + 1), fill_value=0)
+        .reset_index()
+    )
+    batch_count_wide.columns = [agent_col] + [f"batch_{i}_count" for i in range(1, max_batch + 1)]
+
+    agent_summary_df = (
+        expanded_df.groupby(agent_col, dropna=False)
+        .agg(
+            客戶數=(customer_id_col, "nunique"),
+            名單筆數=(customer_id_col, "size"),
+            批次數=("batch", "max"),
+            平均分數=(score_col, "mean"),
+            中位數分數=(score_col, "median"),
+            最高分數=(score_col, "max"),
+            最低分數=(score_col, "min")
+        )
+        .reset_index()
+        .merge(batch_count_wide, on=agent_col, how="left")
+        .sort_values(["客戶數", "平均分數"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+    # =====================================================
+    # 6. batch 明細（只到 batch_5）
+    # =====================================================
+    batch_dfs = {}
+    for b in range(1, max_batch + 1):
+        batch_dfs[b] = (
+            expanded_df[expanded_df["batch"] == b]
+            .sort_values([agent_col, score_col, customer_id_col], ascending=[True, False, True])
+            .reset_index(drop=True)
+        )
+
+    return {
+        "selected_customer_df": selected_customer_df,   # 客戶層最終名單
+        "expanded_df": expanded_df,                     # 展開成客戶 × 所有業務
+        "agent_summary_df": agent_summary_df,
+        "batch_dfs": batch_dfs
+    }
+
+
+def export_agent_batches_excel_customer_level(
+    batch_pack: dict,
+    output_path: str,
+    max_batch: int = 5
+):
+    selected_customer_df = batch_pack["selected_customer_df"].copy()
+    expanded_df = batch_pack["expanded_df"].copy()
+    agent_summary_df = batch_pack["agent_summary_df"].copy()
+    batch_dfs = batch_pack["batch_dfs"]
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        selected_customer_df.to_excel(writer, sheet_name="selected_customer_level", index=False)
+        expanded_df.to_excel(writer, sheet_name="all_selected_expanded", index=False)
+        agent_summary_df.to_excel(writer, sheet_name="agent_summary", index=False)
+
+        for b in range(1, max_batch + 1):
+            batch_df = batch_dfs.get(b, pd.DataFrame())
+            batch_df.to_excel(writer, sheet_name=f"batch_{b}", index=False)
+
+    print(f"已輸出：{output_path}")
+    print(f"客戶層名單數：{len(selected_customer_df):,}")
+    print(f"展開後名單筆數：{len(expanded_df):,}")
+    print(f"輸出批次：1 ~ {max_batch}")
+    
+
+customer_agent_map_df = build_customer_agent_map_from_policy(
+    policy_df=policy_df,
+    customer_id_col="被保人身分證字號",
+    agent_col="經紀人1業代"
+)
+
+batch_pack = build_agent_batch_candidates_customer_level(
+    candidate_output_B_df=candidate_output_B_df,
+    customer_agent_map_df=customer_agent_map_df,
+    customer_id_col="被保人身分證字號",
+    agent_col="經紀人1業代",
+    score_col="final_score",
+    route_col="模型路徑",
+    batch_size=20,
+    max_batch=5
+)
+
+export_agent_batches_excel_customer_level(
+    batch_pack=batch_pack,
+    output_path="D:/投資型/lump/final_agent_batches_customer_level_0410.xlsx",
+    max_batch=5
+)
 
 
 
@@ -1811,7 +2452,7 @@ plt.legend()
 plt.show()
 
 
-# 
+# %% 批次輸出客戶名單
 def top_pct_conversion(df, score_col, label_col="label", p_list=[0.1, 0.2, 0.3]):
     tmp = df[[score_col, label_col]].dropna().copy()
     tmp = tmp.sort_values(score_col, ascending=False).reset_index(drop=True)
@@ -1832,6 +2473,190 @@ top_compare_df = pd.concat([
     top_pct_conversion(unified_test_df, "income_prob"),
     top_pct_conversion(unified_test_df, "final_score"),
 ], axis=0, ignore_index=True)
+
+
+
+
+
+
+def export_agent_batch_excel(
+    candidate_output_B_df: pd.DataFrame,
+    output_path: str,
+    agent_col: str = "目前經紀人1業代",
+    score_col: str = "final_score",
+    id_col: str = "被保人身分證字號",
+    batch_size: int = 20
+):
+    """
+    依業務排序並切 batch，輸出同一份 Excel
+
+    Parameters
+    ----------
+    candidate_output_B_df : pd.DataFrame
+        你的最終名單資料
+    output_path : str
+        Excel 輸出路徑，例如 "D:/投資型/lump/agent_batches.xlsx"
+    agent_col : str
+        業務欄位名稱
+    score_col : str
+        分數欄位名稱
+    id_col : str
+        客戶 ID 欄位
+    batch_size : int
+        每批幾筆，預設 20
+    """
+
+    df = candidate_output_B_df.copy()
+    df.columns = df.columns.str.strip()
+
+    required_cols = [agent_col, score_col, id_col]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"candidate_output_B_df 缺少必要欄位: {missing_cols}")
+
+    # 基本清理
+    df[agent_col] = df[agent_col].astype("string").fillna("未知業務")
+    df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+    df[id_col] = df[id_col].astype("string")
+
+    # 移除沒分數者
+    df = df[df[score_col].notna()].copy()
+
+    # 先依業務、分數排序
+    sort_cols = [agent_col, score_col]
+    ascending_list = [True, False]
+
+    # 若 final_rank 存在，可作為次排序輔助
+    if "final_rank" in df.columns:
+        sort_cols.append("final_rank")
+        ascending_list.append(True)
+
+    # 若客戶 ID 存在，作為最後 tie-breaker
+    sort_cols.append(id_col)
+    ascending_list.append(True)
+
+    df = df.sort_values(sort_cols, ascending=ascending_list).reset_index(drop=True)
+
+    # 業務內排序
+    df["rank_by_agent"] = (
+        df.groupby(agent_col)[score_col]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+
+    # 第幾批（每 batch_size 筆一批）
+    df["release_batch"] = np.ceil(df["rank_by_agent"] / batch_size).astype(int)
+
+    # 是否第一批
+    df["is_first_batch"] = (df["release_batch"] == 1).astype(int)
+
+    # 該業務總名單數
+    df["agent_total_count"] = df.groupby(agent_col)[id_col].transform("count")
+
+    # 該業務總批次數
+    df["agent_total_batches"] = df.groupby(agent_col)["release_batch"].transform("max")
+
+    # 每位業務摘要
+    agent_summary_df = (
+        df.groupby(agent_col, dropna=False)
+        .agg(
+            total_customers=(id_col, "count"),
+            total_batches=("release_batch", "max"),
+            avg_score=(score_col, "mean"),
+            median_score=(score_col, "median"),
+            max_score=(score_col, "max"),
+            min_score=(score_col, "min"),
+            first_batch_count=("is_first_batch", "sum")
+        )
+        .reset_index()
+        .sort_values(["total_customers", "avg_score"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+    # 每位業務各 batch 摘要
+    batch_summary_df = (
+        df.groupby([agent_col, "release_batch"], dropna=False)
+        .agg(
+            batch_count=(id_col, "count"),
+            avg_score=(score_col, "mean"),
+            median_score=(score_col, "median"),
+            max_score=(score_col, "max"),
+            min_score=(score_col, "min")
+        )
+        .reset_index()
+        .sort_values([agent_col, "release_batch"])
+        .reset_index(drop=True)
+    )
+
+    # 第一批名單
+    first_batch_df = (
+        df[df["is_first_batch"] == 1]
+        .copy()
+        .sort_values([agent_col, "rank_by_agent"])
+        .reset_index(drop=True)
+    )
+
+    # 欄位順序整理
+    front_cols = [
+        agent_col,
+        id_col,
+        "rank_by_agent",
+        "release_batch",
+        "is_first_batch",
+        "agent_total_count",
+        "agent_total_batches",
+        score_col,
+        "final_rank" if "final_rank" in df.columns else None,
+        "final_rank_pct" if "final_rank_pct" in df.columns else None,
+        "名單等級" if "名單等級" in df.columns else None,
+        "模型路徑" if "模型路徑" in df.columns else None,
+        "推薦主因" if "推薦主因" in df.columns else None,
+        "rule_score" if "rule_score" in df.columns else None,
+        "rule_score_norm" if "rule_score_norm" in df.columns else None,
+        "model_prob_xgb" if "model_prob_xgb" in df.columns else None,
+        "income_model_prob_xgb" if "income_model_prob_xgb" in df.columns else None,
+        "snapshot_年收入_合成_萬" if "snapshot_年收入_合成_萬" in df.columns else None,
+        "被保人性別" if "被保人性別" in df.columns else None,
+        "snapshot_age" if "snapshot_age" in df.columns else None,
+        "age_group" if "age_group" in df.columns else None,
+        "age_gender_group" if "age_gender_group" in df.columns else None,
+    ]
+    front_cols = [c for c in front_cols if c is not None and c in df.columns]
+    other_cols = [c for c in df.columns if c not in front_cols]
+
+    df = df[front_cols + other_cols]
+    first_batch_df = first_batch_df[[c for c in df.columns if c in first_batch_df.columns]]
+
+    # 輸出 Excel
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="all_candidates", index=False)
+        agent_summary_df.to_excel(writer, sheet_name="agent_summary", index=False)
+        batch_summary_df.to_excel(writer, sheet_name="batch_summary", index=False)
+        first_batch_df.to_excel(writer, sheet_name="first_batch_only", index=False)
+
+    print(f"已輸出 Excel：{output_path}")
+    print(f"總名單數：{len(df):,}")
+    print(f"業務數：{df[agent_col].nunique():,}")
+    print(f"第一批名單數：{len(first_batch_df):,}")
+
+    return {
+        "all_candidates_df": df,
+        "agent_summary_df": agent_summary_df,
+        "batch_summary_df": batch_summary_df,
+        "first_batch_df": first_batch_df
+    }
+
+# 執行
+result_pack = export_agent_batch_excel(
+    candidate_output_B_df=candidate_output_B_df,
+    output_path="D:/投資型/lump/customer_list_batches.xlsx",
+    agent_col="目前經紀人1業代",
+    score_col="final_score",
+    id_col="被保人身分證字號",
+    batch_size=20
+)
+
+
 
 
 
