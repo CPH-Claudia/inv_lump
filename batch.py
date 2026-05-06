@@ -185,12 +185,55 @@ def execute(df):
 
         g["靜止戶批次"] = ((g["靜止戶排序順位"] - 1) // BATCH_SIZE) + 1
 
-        # ===== 解鎖 =====
-        lump_visit = g[g[LUMP_FLAG] == 1]["是否含#躉投_row"].sum()
-        sleep_visit = g[g[SLEEP_FLAG] == 1]["是否含#靜止_row"].sum()
+        # ===== 解鎖：只能用已開放批次內的有效拜訪來解鎖下一批 =====
+        # ===== 批次總數（先算，等等會用）=====
+        lump_total_batches = int(g["躉投批次"].max()) if g["躉投批次"].notna().any() else 0
+        sleep_total_batches = int(g["靜止戶批次"].max()) if g["靜止戶批次"].notna().any() else 0
 
-        g["目前開放躉投批次"] = 1 if lump_visit < UNLOCK_THRESHOLD else 2
-        g["目前開放靜止戶批次"] = 1 if sleep_visit < UNLOCK_THRESHOLD else 2
+        # 躉投：每一批各自計算有效拜訪
+        lump_batch_visit = (
+            g[g[LUMP_FLAG] == 1]
+            .groupby("躉投批次")["是否含#躉投_row"]
+            .sum()
+            .to_dict()
+        )
+
+        current_open_lump = 1
+
+        while current_open_lump < lump_total_batches:
+            visited_cnt = lump_batch_visit.get(current_open_lump, 0)
+
+            if visited_cnt >= UNLOCK_THRESHOLD:
+                current_open_lump += 1
+            else:
+                break
+
+        current_open_lump = min(current_open_lump, max(lump_total_batches, 1))
+
+
+        # 靜止戶：每一批各自計算有效拜訪
+        sleep_batch_visit = (
+            g[g[SLEEP_FLAG] == 1]
+            .groupby("靜止戶批次")["是否含#靜止_row"]
+            .sum()
+            .to_dict()
+        )
+
+        current_open_sleep = 1
+
+        while current_open_sleep < sleep_total_batches:
+            visited_cnt = sleep_batch_visit.get(current_open_sleep, 0)
+
+            if visited_cnt >= UNLOCK_THRESHOLD:
+                current_open_sleep += 1
+            else:
+                break
+
+        current_open_sleep = min(current_open_sleep, max(sleep_total_batches, 1))
+
+
+        g["目前開放躉投批次"] = current_open_lump
+        g["目前開放靜止戶批次"] = current_open_sleep
 
         # ===== 是否釋出 =====
         g["是否釋出"] = np.where(
@@ -200,11 +243,19 @@ def execute(df):
         )
 
         # ===== KPI =====
-        g["躉投有效拜訪客戶數"] = lump_visit
-        g["靜止戶有效拜訪客戶數"] = sleep_visit
-        g["有效拜訪客戶數"] = lump_visit + sleep_visit
+        current_lump_visit = lump_batch_visit.get(current_open_lump, 0)
+        current_sleep_visit = sleep_batch_visit.get(current_open_sleep, 0)
 
-        g["距離解鎖下一批"] = max(UNLOCK_THRESHOLD - (lump_visit + sleep_visit), 0)
+        g["躉投有效拜訪客戶數"] = current_lump_visit
+        g["靜止戶有效拜訪客戶數"] = current_sleep_visit
+        g["有效拜訪客戶數"] = current_lump_visit + current_sleep_visit
+
+        g["躉投距離解鎖下一批"] = max(UNLOCK_THRESHOLD - current_lump_visit, 0)
+        g["靜止戶距離解鎖下一批"] = max(UNLOCK_THRESHOLD - current_sleep_visit, 0)
+
+        g["距離解鎖下一批"] = (
+            g["躉投距離解鎖下一批"] + g["靜止戶距離解鎖下一批"]
+        )
 
         # g["躉投批次顯示"] = g["目前開放躉投批次"].astype(str) + "/?"
         # g["靜止戶批次顯示"] = g["目前開放靜止戶批次"].astype(str) + "/?"
@@ -212,11 +263,23 @@ def execute(df):
         lump_total_batches = int(g["躉投批次"].max()) if g["躉投批次"].notna().any() else 0
         sleep_total_batches = int(g["靜止戶批次"].max()) if g["靜止戶批次"].notna().any() else 0
 
-        g["躉投批次顯示"] = (
+        # g["躉投批次顯示"] = (
+        #     g["目前開放躉投批次"].astype(str) + "/" + str(lump_total_batches)
+        # )
+
+        # g["靜止戶批次顯示"] = (
+        #     g["目前開放靜止戶批次"].astype(str) + "/" + str(sleep_total_batches)
+        # )
+
+        g["躉投批次顯示"] = np.where(
+            lump_total_batches == 0,
+            "無躉投名單",
             g["目前開放躉投批次"].astype(str) + "/" + str(lump_total_batches)
         )
 
-        g["靜止戶批次顯示"] = (
+        g["靜止戶批次顯示"] = np.where(
+            sleep_total_batches == 0,
+            "無靜止名單",
             g["目前開放靜止戶批次"].astype(str) + "/" + str(sleep_total_batches)
         )
 
