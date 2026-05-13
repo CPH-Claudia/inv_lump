@@ -16,9 +16,11 @@ VISIT_ID = "拜訪紀錄UUID"
 VISIT_DT = "拜訪時間"
 NOTE_COL = "拜訪備註"
 
-RELEASE_DATE = pd.Timestamp("2026-03-15")
+RELEASE_DATE = pd.Timestamp("2023-01-01")
 BATCH_SIZE = 20
-UNLOCK_THRESHOLD = 1
+UNLOCK_THRESHOLD = 2
+VISIT_BASE_START = pd.Timestamp("2026-01-01")
+VISIT_RELEASE_DATE = pd.Timestamp("2026-05-15")
 
 
 # ===== Schema =====
@@ -61,6 +63,10 @@ def get_output_schema():
         "是否有效拜訪": prep_int(),
         "是否含#躉投": prep_int(),
         "是否含#靜止": prep_int(),
+        "有打#關鍵字客戶": prep_int(),
+
+        "2026_0101_0515拜訪次數": prep_int(),
+        "2026_0515後拜訪次數": prep_int(),
 
         "有效拜訪時間": prep_string(),
 
@@ -107,27 +113,92 @@ def execute(df):
 
     data["拜訪時間_解析"] = parse_dt_series(data[VISIT_DT])
 
-    note = data[NOTE_COL].fillna("")
+    data["拜訪紀錄UUID_清理"] = data[VISIT_ID].fillna("").astype(str).str.strip()
+
+    data["是否20260101至0515拜訪"] = np.where(
+        (data["拜訪時間_解析"] >= VISIT_BASE_START) &
+        (data["拜訪時間_解析"] < VISIT_RELEASE_DATE) &
+        (data["拜訪紀錄UUID_清理"] != ""),
+        1,
+        0
+    )
+
+    data["是否0515後拜訪"] = np.where(
+        (data["拜訪時間_解析"] >= VISIT_RELEASE_DATE) &
+        (data["拜訪紀錄UUID_清理"] != ""),
+        1,
+        0
+    )
+
+    note_raw = data[NOTE_COL].fillna("").astype(str)
 
     # ===== 標籤 =====
     data["是否名單釋出日後"] = data["拜訪時間_解析"] >= RELEASE_DATE
 
+    # ===== 備註文字標準化 =====
+    # 處理：
+    # 1. 全形＃ → 半形#
+    # 2. # 前後空白
+    # 3. 關鍵字中間誤打空白，例如 #躉 繳
+    note_clean = (
+        note_raw
+        .str.replace("＃", "#", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace("　", "", regex=False)
+    )
+
+    data["是否名單釋出日後"] = data["拜訪時間_解析"] >= RELEASE_DATE
+
+    # ===== 一定要有 # 才算 =====
     data["是否含#躉投_row"] = np.where(
-        data["是否名單釋出日後"] & note.str.contains("#2026夏賽"),
-        1, 0
+        data["是否名單釋出日後"] &
+        note_clean.str.contains(r"險", regex=True, na=False),
+        1,
+        0
     )
 
     data["是否含#靜止_row"] = np.where(
-        data["是否名單釋出日後"] & note.str.contains("#靜止"),
-        1, 0
+        data["是否名單釋出日後"] &
+        note_clean.str.contains(r"#靜止", regex=True, na=False),
+        1,
+        0
     )
 
-    data["是否有效拜訪_row"] = np.where(
-        (data["是否含#躉投_row"] == 1) | (data["是否含#靜止_row"] == 1),
-        1, 0
+    # ===== 合併欄位：給業務看比較直覺 =====
+    data["有打#關鍵字客戶_row"] = np.where(
+        (data["是否含#躉投_row"] == 1) |
+        (data["是否含#靜止_row"] == 1),
+        1,
+        0
+    )
+
+    # 這個欄位可以沿用原本「是否有效拜訪」邏輯
+    data["是否有效拜訪_row"] = data["有打#關鍵字客戶_row"]
+
+    data["有效拜訪時間_row"] = data["拜訪時間_解析"].where(
+        data["是否有效拜訪_row"] == 1
     )
 
     data["有效拜訪時間_row"] = data["拜訪時間_解析"].where(data["是否有效拜訪_row"] == 1)
+
+    visit_cnt = (
+        data
+        .drop_duplicates([AGENT_COL, CUST_COL, VISIT_ID])
+        .groupby([AGENT_COL, CUST_COL], dropna=False)
+        .agg(
+            **{
+                "2026_0101_0515拜訪次數": (
+                    "是否20260101至0515拜訪",
+                    "sum"
+                ),
+                "2026_0515後拜訪次數": (
+                    "是否0515後拜訪",
+                    "sum"
+                )
+            }
+        )
+        .reset_index()
+    )
 
     # ===== 客戶彙總 =====
     customer = (
@@ -142,6 +213,7 @@ def execute(df):
             "是否有效拜訪_row": "max",
             "是否含#躉投_row": "max",
             "是否含#靜止_row": "max",
+            "有打#關鍵字客戶_row": "max",
             "有效拜訪時間_row": "min"
         })
         .reset_index()
@@ -155,6 +227,24 @@ def execute(df):
 
     customer["郵遞區號_排序用"] = pd.to_numeric(customer[ZIP_COL], errors="coerce")
     customer["地區排序輔助"] = customer[DISTRICT_COL].fillna("ZZZ")
+
+    customer = customer.merge(
+        visit_cnt,
+        on=[AGENT_COL, CUST_COL],
+        how="left"
+    )
+
+    customer["2026_0101_0515拜訪次數"] = (
+        customer["2026_0101_0515拜訪次數"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    customer["2026_0515後拜訪次數"] = (
+        customer["2026_0515後拜訪次數"]
+        .fillna(0)
+        .astype(int)
+    )
 
     result_list = []
 
@@ -293,6 +383,8 @@ def execute(df):
     result["是否有效拜訪"] = result["是否有效拜訪_row"]
     result["是否含#躉投"] = result["是否含#躉投_row"]
     result["是否含#靜止"] = result["是否含#靜止_row"]
+    result["有打#關鍵字客戶"] = result["有打#關鍵字客戶_row"]
+
     result["有效拜訪時間"] = result["有效拜訪時間_row"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
 
     # ===== 避免 NaTType 無法 JSON serializable =====
